@@ -371,7 +371,8 @@ struct SpacesFootBar: View {
                 let current = pager.onChats ? 0 : (pages.firstIndex(of: pager.spaceID ?? "") ?? 0)
                 CardCapsule(names: ["Chats"] + spaces.map(\.name), current: current,
                             position: min(max(pager.position, 0), CGFloat(pages.count - 1)),
-                            width: SpacesFootBar.capsuleWidth(layout), dark: false, bare: true, shared: .foot) { i in
+                            width: SpacesFootBar.capsuleWidth(layout), dark: false, bare: true, shared: .foot,
+                            pagingByGesture: pager.pagingByGesture) { i in
                     app.field.putKeyboardAway()
                     pager.jump = pages[i]
                 } sheetDrag: { _, _, _ in } about: {} settings: {}
