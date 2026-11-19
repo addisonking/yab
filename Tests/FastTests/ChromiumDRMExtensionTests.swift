@@ -166,14 +166,23 @@ struct ChromiumDRMExtensionTests {
 
     @Test func theInjectedBootstrapLandsInsideTheHead() {
         let page = "<!doctype html><html><head><title>x</title></head><body></body></html>"
-        let served = String(decoding: ChromiumDRMResources.inject("globalThis.witness=true;", into: Data(page.utf8))!, as: UTF8.self)
-        #expect(served.contains("<head><script>globalThis.witness=true;</script><title>x</title>"))
+        let served = String(decoding: ChromiumDRMResources.inject(into: Data(page.utf8))!, as: UTF8.self)
+        #expect(served.contains("<head><script src=\"/__yab/page-bootstrap.js\"></script><title>x</title>"))
         let headless = "<!doctype html><html><body><p>hi</p></body></html>"
-        let servedHeadless = String(decoding: ChromiumDRMResources.inject("globalThis.witness=true;", into: Data(headless.utf8))!, as: UTF8.self)
-        #expect(servedHeadless.hasPrefix("<!doctype html><script>globalThis.witness=true;</script><html>"))
+        let servedHeadless = String(decoding: ChromiumDRMResources.inject(into: Data(headless.utf8))!, as: UTF8.self)
+        #expect(servedHeadless.hasPrefix("<!doctype html><script src=\"/__yab/page-bootstrap.js\"></script><html>"))
         let bare = "just text"
-        let servedBare = String(decoding: ChromiumDRMResources.inject("x", into: Data(bare.utf8))!, as: UTF8.self)
-        #expect(servedBare.hasPrefix("<script>x</script>"))
+        let servedBare = String(decoding: ChromiumDRMResources.inject(into: Data(bare.utf8))!, as: UTF8.self)
+        #expect(servedBare.hasPrefix("<script src=\"/__yab/page-bootstrap.js\"></script>"))
+    }
+
+    /// Chrome serves an extension page under the extension's own policy, or
+    /// its default when the manifest names none; the injected bootstrap is a
+    /// same-origin script so that policy admits it.
+    @Test func pagePoliciesFollowTheManifestOrDefault() {
+        #expect(ChromiumDRMResources.pagePolicy([:]) == "script-src 'self'; object-src 'self'")
+        #expect(ChromiumDRMResources.pagePolicy(["content_security_policy": ["extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"]]) == "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'")
+        #expect(ChromiumDRMResources.pagePolicy(["content_security_policy": "script-src 'self'; object-src 'self'"]) == "script-src 'self'; object-src 'self'")
     }
 
     /// An extension's served page talks to its own isolated world over the

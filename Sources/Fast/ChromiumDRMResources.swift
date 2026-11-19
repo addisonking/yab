@@ -17,6 +17,7 @@ import YabCoreClient
 @MainActor
 final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
     static let shared = ChromiumDRMResources()
+    static let bootstrapPath = "__yab/page-bootstrap.js"
     private var stopped: Set<ObjectIdentifier> = []
 
     nonisolated func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
@@ -51,8 +52,16 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         let epoch = bridge.epoch
         // A reload can retire a dynamic ID even when the manifest and extension ID stay the same.
         if dynamic, (try? await session.dynamicResourceHost(owner)) != id { return fail(task) }
-        guard let reply = try? await session.request("ext.bridge.files", ["extension": owner, "files": [path]]),
-              let source = reply[path].string, bridge.epoch == epoch, live(task) else { return fail(task) }
+        let bootstrap = path == Self.bootstrapPath ? bridge.pageBootstrap(for: owner) : nil
+        let sourced: String
+        if path == Self.bootstrapPath {
+            guard let bootstrap else { return fail(task) }
+            sourced = bootstrap
+        } else {
+            guard let reply = try? await session.request("ext.bridge.files", ["extension": owner, "files": [path]]),
+                  let source = reply[path].string, bridge.epoch == epoch, live(task) else { return fail(task) }
+            sourced = source
+        }
         var servedURL = url
         if dynamic {
             guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return fail(task) }
@@ -66,7 +75,7 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         }
         // Text arrives as it is; anything the native read could not decode
         // (an image, a font) arrives base64-wrapped.
-        let body = Self.bytes(from: source) ?? Data(source.utf8)
+        let body = Self.bytes(from: sourced) ?? Data(sourced.utf8)
         // An extension page's own scripts run in its frame's page world, where
         // the isolated-world API never exists. Serving the page installs the
         // API there directly, the way Chrome gives an extension page its own
@@ -80,10 +89,17 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
             // Fonts load in CORS mode from the sandbox's opaque origin.
             headers["Access-Control-Allow-Origin"] = type.hasPrefix("font/") ? "null" : nil
         }
+        if path == Self.bootstrapPath { headers["Cache-Control"] = "no-store" }
         if let policy = Self.sandboxPolicy(path, owner: owner, manifest: manifest) {
             headers["Content-Security-Policy"] = policy
-        } else if type.hasPrefix("text/html"), let bootstrap = bridge.pageBootstrap(for: owner) {
-            document = Self.inject(bootstrap, into: body) ?? body
+        } else if type.hasPrefix("text/html") {
+            // Chrome applies the extension's own page policy to its pages, or
+            // its default when the manifest names none. The bootstrap is a
+            // same-origin script, so 'self' admits it without loosening the
+            // page's other restrictions, and a page that never declares a
+            // policy keeps the protections Chrome would give it.
+            headers["Content-Security-Policy"] = Self.pagePolicy(manifest)
+            if bridge.pageBootstrap(for: owner) != nil { document = Self.inject(into: body) ?? body }
         }
         guard let response = HTTPURLResponse(url: servedURL, statusCode: 200, httpVersion: nil, headerFields: headers),
               live(task) else { return fail(task) }
@@ -119,6 +135,15 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
     static func sandboxed(_ path: String, manifest: [String: Any]) -> Bool {
         let pages = (manifest["sandbox"] as? [String: Any])?["pages"] as? [String] ?? []
         return pages.contains { pattern($0.hasPrefix("/") ? String($0.dropFirst()) : $0, covers: path) }
+    }
+    /// Chrome's policy for an extension's own pages: the manifest's
+    /// extension_pages policy (a string in older manifests), or the default
+    /// Chrome enforces when a manifest names none.
+    static func pagePolicy(_ manifest: [String: Any]) -> String {
+        let declared = manifest["content_security_policy"]
+        if let object = declared as? [String: Any], let policy = object["extension_pages"] as? String, !policy.isEmpty { return policy }
+        if let policy = declared as? String, !policy.isEmpty { return policy }
+        return "script-src 'self'; object-src 'self'"
     }
     static func sandboxPolicy(_ path: String, owner: String, manifest: [String: Any]) -> String? {
         guard sandboxed(path, manifest: manifest) else { return nil }
@@ -204,9 +229,9 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
     /// The bootstrap goes where the page's own scripts first see it, without
     /// pushing the document out of standards mode: after the head, or, in a
     /// page without one, right after the doctype.
-    static func inject(_ bootstrap: String, into body: Data) -> Data? {
+    static func inject(into body: Data) -> Data? {
         guard let text = String(data: body, encoding: .utf8) else { return nil }
-        let script = "<script>\(bootstrap)</script>"
+        let script = "<script src=\"/" + bootstrapPath + "\"></script>"
         if let head = text.range(of: #"<head[^>]*>"#, options: .regularExpression) {
             var injected = String(text[..<head.upperBound]); injected += script; injected += String(text[head.upperBound...])
             return Data(injected.utf8)
