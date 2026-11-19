@@ -49,7 +49,10 @@ struct ChromiumPopupTextInputTests {
     /// the input path (keyDown, the input context, insertText), the same
     /// hop that ends in popup.send(["kind": "text"]), and not only routed
     /// by the shared Boolean. A field that takes no text gets nothing.
-    @MainActor @Test func aPlainKeyIsDeliveredAsTextThroughThePopupInput() {
+    @MainActor
+    @Test(.enabled("needs a test screen") { await TestScreen.available })
+    func aPlainKeyIsDeliveredAsTextThroughThePopupInput() throws {
+        let screen = try #require(TestScreen.screen)
         final class RecordingInput: ChromiumPopupInput {
             var inserted: [String] = []
             override func insertText(_ string: Any, replacementRange: NSRange) {
@@ -57,40 +60,38 @@ struct ChromiumPopupTextInputTests {
                 super.insertText(string, replacementRange: replacementRange)
             }
         }
-        func field(_ editable: Bool) -> (RecordingInput, ChromiumExtensionPopup, ChromiumPage, Tab) {
-            let tab = Tab(shy: true)
-            let page = ChromiumPage(tab: tab)
-            let popup = ChromiumExtensionPopup(token: "t1", extensionID: "ext922", page: page)
-            popup.receiveTextInput(["token": .string("t1"), "editable": .bool(editable),
-                "caret": .object(["x": .number(47), "y": .number(84), "width": .number(1), "height": .number(18)])])
-            let input = RecordingInput(frame: CGRect(origin: .zero, size: CGSize(width: 480, height: 600)))
-            input.popup = popup
-            return (input, popup, page, tab)
-        }
-        func key(_ character: String, _ code: UInt16, window: Int = 0) -> NSEvent? {
+        func key(_ character: String, _ code: UInt16, window: Int) -> NSEvent? {
             NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 1,
                 windowNumber: window, context: nil, characters: character, charactersIgnoringModifiers: character,
                 isARepeat: false, keyCode: code)
         }
 
-        // The host retains the popup in production; the test keeps it alive
-        // the same way, as the input view holds it weakly.
-        let (typing, popup, page, tab) = field(true)
+        let tab = Tab(shy: true)
+        let page = ChromiumPage(tab: tab)
         defer { page.retire(call: false, pictureInPicture: false); tab.close() }
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: CGSize(width: 480, height: 600)),
-            styleMask: [.titled], backing: .buffered, defer: false)
+        let popup = ChromiumExtensionPopup(token: "t1", extensionID: "ext922", page: page)
+        popup.receiveTextInput(["token": .string("t1"), "editable": .bool(true),
+            "caret": .object(["x": .number(47), "y": .number(84), "width": .number(1), "height": .number(18)])])
+        let frame = NSRect(x: 32, y: 32, width: 480, height: 600)
+        let typing = RecordingInput(frame: NSRect(origin: .zero, size: frame.size))
+        typing.popup = popup
+        let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false, screen: screen)
+        try #require(window.screen === screen)
+        defer { window.orderOut(nil) }
         window.contentView = typing
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(typing)
         for (character, code) in [("t", 17), ("e", 14), ("s", 1)] as [(String, UInt16)] {
-            typing.keyDown(with: key(character, code, window: window.windowNumber)!)
+            typing.keyDown(with: try #require(key(character, code, window: window.windowNumber)))
         }
-        window.orderOut(nil)
         #expect(typing.inserted == ["t", "e", "s"])
 
-        let (idle, _, idlePage, idleTab) = field(false)
-        defer { idlePage.retire(call: false, pictureInPicture: false); idleTab.close() }
-        idle.keyDown(with: key("t", 17)!)
-        #expect(idle.inserted == [])
+        popup.receiveTextInput(["token": .string("t1"), "editable": .bool(false)])
+        let event = try #require(key("t", 17, window: window.windowNumber))
+        // The input view holds the popup weakly.
+        withExtendedLifetime(popup) {
+            typing.keyDown(with: event)
+            #expect(typing.inserted == ["t", "e", "s"])
+        }
     }
 }
