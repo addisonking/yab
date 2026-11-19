@@ -203,6 +203,14 @@ final class ChromiumDRMExtensions {
             }
         }
     }
+    /// The bootstrap injected into an extension page the resource handler
+    /// serves: the page's own scripts reach the bridge through the world
+    /// Yab already keeps on that page, over the document they share.
+    func pageBootstrap(for id: String) -> String? {
+        guard let entry = entries[id], let manifest = entry["manifest"] as? [String: Any] else { return nil }
+        let config: [String: Any] = ["id": id, "epoch": epoch, "manifest": manifest, "messages": entry["messages"] ?? [:], "language": Locale.current.identifier.replacingOccurrences(of: "_", with: "-")]
+        return try? "(()=>{try{\(try ChromiumDRMExtensionScripts.bootstrap(config, page: true))}catch(error){}})();"
+    }
     init(tab: Tab, web: WKWebView) throws {
         self.tab = tab; self.web = web; session = try .of(tab)
         session.pages[tab.id] = .init(value: self)
@@ -331,14 +339,26 @@ final class ChromiumDRMExtensions {
     private func registerURL(_ url: URL) -> URL {
         url.scheme == "chrome-extension" ? web?.url ?? url : url
     }
+    /// A message's claimed address has to be the frame's own. WebKit tells
+    /// the frame either through its request or its security origin; a page
+    /// can name an extension's page, but it cannot make WebKit say its frame
+    /// is one.
+    private func identityHolds(_ id: String, _ url: URL, _ message: WKScriptMessage) -> Bool {
+        let frame = message.frameInfo, origin = frame.securityOrigin
+        if url.scheme == "chrome-extension" {
+            return (origin.protocol == "chrome-extension" && origin.host == url.host)
+                || (frame.request.url?.scheme == "chrome-extension" && frame.request.url?.host == url.host)
+        }
+        guard frame.request.url != nil else { return false }
+        return url.scheme == origin.protocol && url.host == origin.host
+            && (url.port ?? (url.scheme == "https" ? 443 : 80)) == (origin.port == 0 ? (url.scheme == "https" ? 443 : 80) : origin.port)
+    }
     private func message(_ id: String, _ message: WKScriptMessage) async throws -> Any {
         guard let tab, !tab.gone, tab.chromiumProfile == session.profile, message.webView === web,
               let body = message.body as? [String: Any], body["epoch"] as? String == epoch,
               let nonce = body["nonce"] as? String, let requestURL = message.frameInfo.request.url,
               let url = (body["url"] as? String).flatMap(URL.init(string:)) ?? Optional(requestURL), allowed(id, url),
-              url.scheme == "chrome-extension" ? requestURL.scheme == "chrome-extension" && requestURL.host == url.host
-              : url.scheme == message.frameInfo.securityOrigin.protocol && url.host == message.frameInfo.securityOrigin.host
-                && (url.port ?? (url.scheme == "https" ? 443 : 80)) == (message.frameInfo.securityOrigin.port == 0 ? (url.scheme == "https" ? 443 : 80) : message.frameInfo.securityOrigin.port)
+              identityHolds(id, url, message)
         else { throw YabCoreError.remote("Extension document permission or identity expired") }
         let key = id + ":" + nonce
         if body["op"] as? String == "hello" {

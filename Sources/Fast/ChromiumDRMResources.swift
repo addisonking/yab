@@ -9,9 +9,10 @@ import YabCoreClient
 /// for: the frames mounted empty and the menu never rendered. The bytes come
 /// from the same native read the content scripts use (ext.bridge.files: the
 /// profile's catalog, an extension enabled there, a file under its own root,
-/// size capped), and only what the extension declared web-accessible reaches
-/// a page, and only from the origins it listed. An extension's own pages can
-/// chain freely; a page can never take a frame or a file it was not offered.
+/// size capped; binary files arrive base64-wrapped), and only what the
+/// extension declared web-accessible reaches the frame asking for it, and
+/// only from the origins it listed. An extension's own pages can chain
+/// freely; a page can never take a frame or a file it was not offered.
 @available(macOS 15.4, *)
 @MainActor
 final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
@@ -27,13 +28,23 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
     private func live(_ task: WKURLSchemeTask) -> Bool { !stopped.contains(ObjectIdentifier(task)) }
 
     private func serve(_ webView: WKWebView, _ task: WKURLSchemeTask) async {
+        // A stopped or finished request leaves nothing behind: the set only
+        // holds requests still being answered.
+        defer { stopped.remove(ObjectIdentifier(task)) }
         guard let url = task.request.url, url.scheme?.lowercased() == "chrome-extension", let id = url.host, !id.isEmpty,
               url.path.count > 1, !url.path.contains("..") else { return fail(task) }
         let path = String(url.path.dropFirst())
-        // The page embedding the frame. A main frame is its own document, and
-        // main frames are not served here: a page can't walk itself into an
-        // extension's pages, the way Chrome refuses the web that address.
-        guard let page = task.request.mainDocumentURL ?? webView.url, page != url,
+        // The frame asking for the file, not the page on top of it: an
+        // allowed site must not lend its permission to a frame from a site
+        // the extension left out. WebKit names the asking frame in the
+        // Referer it sends; without one, only the top page is left to
+        // answer for the request.
+        let asker = task.request.value(forHTTPHeaderField: "Referer").flatMap(URL.init(string:))
+            ?? task.request.mainDocumentURL ?? webView.url
+        // A main frame is its own document, and main frames are not served
+        // here: a page can't walk itself into an extension's pages, the way
+        // Chrome refuses the web that address.
+        guard let page = asker, page != url,
               let tab = Extensions.shared.tab(showing: webView), let bridge = tab.chromiumDRMExtensions,
               let entry = bridge.entries[id], let manifest = entry["manifest"] as? [String: Any] else { return fail(task) }
         let session = bridge.session
@@ -51,13 +62,25 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
             guard accessible else { return fail(task) }
         }
         guard let reply = try? await session.request("ext.bridge.files", ["extension": id, "files": [path]]),
-              let source = reply[path].string, !source.isEmpty, live(task) else { return fail(task) }
+              let source = reply[path].string, live(task) else { return fail(task) }
+        // Text arrives as it is; anything the native read could not decode
+        // (an image, a font) arrives base64-wrapped.
+        let body = Self.bytes(from: source) ?? Data(source.utf8)
+        // An extension page's own scripts run in its frame's page world, where
+        // the isolated-world API never exists. Serving the page installs the
+        // API there directly, the way Chrome gives an extension page its own
+        // runtime; the bridge then holds every message to WebKit's own word
+        // for which frame sent it.
+        var document = body
+        if Self.mime(path).hasPrefix("text/html"), let bootstrap = bridge.pageBootstrap(for: id) {
+            document = Self.inject(bootstrap, into: body) ?? body
+        }
         guard let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
                                              headerFields: ["Content-Type": Self.mime(path), "Access-Control-Allow-Origin": "*"]),
               live(task) else { return fail(task) }
         task.didReceive(response)
         guard live(task) else { return }
-        task.didReceive(Data(source.utf8))
+        task.didReceive(document)
         if live(task) { task.didFinish() }
     }
     private func fail(_ task: WKURLSchemeTask) {
@@ -65,14 +88,35 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         task.didFailWithError(YabCoreError.remote("Extension resource is unavailable to this page"))
         stopped.insert(ObjectIdentifier(task))
     }
-    /// A web-accessible entry's pattern: `*` covers the rest of the path
-    /// between what the entry says before and after it.
+    /// A web-accessible entry's pattern: every `*` stands for any run of
+    /// characters, including none.
     static func pattern(_ value: String, covers path: String) -> Bool {
-        guard let star = value.firstIndex(of: "*") else { return value == path }
-        var head = String(value[..<star])
-        if head.hasPrefix("/") { head = String(head.dropFirst()) }
-        let tail = String(value[value.index(after: star)...])
-        return path.hasPrefix(head) && path.hasSuffix(tail) && path.count > head.count + tail.count
+        guard value.contains("*") else { return value == path }
+        let expression = NSRegularExpression.escapedPattern(for: value).replacingOccurrences(of: "\\*", with: ".*")
+        return path.range(of: "^" + expression + "$", options: .regularExpression) != nil
+    }
+    /// Text as it is; a native base64 wrap as bytes.
+    static func bytes(from source: String) -> Data? {
+        guard source.hasPrefix("{\"b64\":"), let data = source.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let encoded = object["b64"] as? String else { return nil }
+        return Data(base64Encoded: encoded)
+    }
+    /// The bootstrap goes where the page's own scripts first see it, without
+    /// pushing the document out of standards mode: after the head, or, in a
+    /// page without one, right after the doctype.
+    static func inject(_ bootstrap: String, into body: Data) -> Data? {
+        guard let text = String(data: body, encoding: .utf8) else { return nil }
+        let script = "<script>\(bootstrap)</script>"
+        if let head = text.range(of: #"<head[^>]*>"#, options: .regularExpression) {
+            var injected = String(text[..<head.upperBound]); injected += script; injected += String(text[head.upperBound...])
+            return Data(injected.utf8)
+        }
+        if let doctype = text.range(of: #"<!doctype[^>]*>"#, options: [.regularExpression, .caseInsensitive]) {
+            var injected = String(text[..<doctype.upperBound]); injected += script; injected += String(text[doctype.upperBound...])
+            return Data(injected.utf8)
+        }
+        return Data((script + text).utf8)
     }
     private static func mime(_ path: String) -> String {
         let kind = (path as NSString).pathExtension.lowercased()

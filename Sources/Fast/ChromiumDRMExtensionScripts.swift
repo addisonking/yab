@@ -5,16 +5,14 @@ enum ChromiumDRMExtensionScripts {
     static let shim = #"""
     (()=>{
       if(globalThis.__yabWK)return;
-      const config=__CONFIG__,handler=webkit.messageHandlers.yabChromiumExtension;
-      const nonce=crypto.randomUUID(),ports=new Map();let serial=0;
-      const event=()=>{const listeners=new Set();return {addListener:f=>listeners.add(f),removeListener:f=>listeners.delete(f),hasListener:f=>listeners.has(f),hasListeners:()=>!!listeners.size,listeners}};
-      const ready=handler.postMessage({op:'hello',nonce,epoch:config.epoch,url:location.href});
+      const config=__CONFIG__,ports=new Map();let serial=0;
       // An extension's messages and stored values reach Yab as plain data,
       // as Chromium's JSON-serialized messaging has them: a DOMRect posted
       // whole crashed WebKit of macOS 15 in Yab's own JavaScript context
       // (WebKitIPCBoundary.plainScript).
       const plain=\#(WebKitIPCBoundary.plainScript);
-      const call=(op,args)=>ready.then(()=>handler.postMessage({op,args:plain(args),nonce,epoch:config.epoch,url:location.href}));
+      __TRANSPORT__
+      const event=()=>{const listeners=new Set();return {addListener:f=>listeners.add(f),removeListener:f=>listeners.delete(f),hasListener:f=>listeners.has(f),hasListeners:()=>!!listeners.size,listeners}};
       const runtime={id:config.id,getManifest:()=>config.manifest,getURL:path=>'chrome-extension://'+config.id+'/'+String(path||'').replace(/^\//,''),onMessage:event(),onConnect:event()};
       const callback=(promise,cb)=>{if(typeof cb!=='function')return promise;promise.then(x=>cb(x),e=>{runtime.lastError={message:String(e.message||e)};try{cb()}finally{delete runtime.lastError}})};
       runtime.sendMessage=(...args)=>{const cb=typeof args.at(-1)==='function'?args.pop():null;if(args.length>1&&typeof args[0]==='string'&&/^[a-p]{32}$/.test(args[0])){if(args.shift()!==config.id)return callback(Promise.reject(Error('Cross-extension messaging is unavailable')),cb)}return callback(call('runtime.sendMessage',[args[0]]),cb)};
@@ -26,6 +24,7 @@ enum ChromiumDRMExtensionScripts {
       // Some extensions choose the browser namespace on WebKit's Safari user agent.
       globalThis.browser=globalThis.chrome={runtime,storage,i18n};
       const receive=async(op,args)=>{
+        if(relayIn){document.dispatchEvent(new CustomEvent('yab-page-incoming',{detail:JSON.stringify({op,args})}));return null}
         if(op==='tabs.sendMessage')return new Promise((resolve,reject)=>{
           const listeners=[...runtime.onMessage.listeners];
           if(!listeners.length){reject(Error('Receiving end does not exist'));return}
@@ -67,8 +66,49 @@ enum ChromiumDRMExtensionScripts {
         let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys])
         return String(decoding: data, as: UTF8.self)
     }
-    static func bootstrap(_ config: [String: Any]) throws -> String {
-        shim.replacingOccurrences(of: "__CONFIG__", with: try json(config))
+    /// The world's transport: every call crosses to the app through the
+    /// handler, and on an extension's own page the page's world can reach
+    /// this world's bridge through the document they share.
+    static let worldTransport = #"""
+      const handler=webkit.messageHandlers.yabChromiumExtension;
+      const nonce=crypto.randomUUID();
+      const ready=handler.postMessage({op:'hello',nonce,epoch:config.epoch,url:location.href});
+      const call=(op,args)=>ready.then(()=>handler.postMessage({op,args:plain(args),nonce,epoch:config.epoch,url:location.href}));
+      const relayIn=location.protocol==='chrome-extension:';
+      if(relayIn){
+        document.addEventListener('yab-page-call',event=>{
+          let request;try{request=JSON.parse(event.detail)}catch(error){return}
+          call(request.op,request.args).then(
+            value=>document.dispatchEvent(new CustomEvent('yab-page-result',{detail:JSON.stringify({callId:request.callId,value:plain(value)})})),
+            error=>document.dispatchEvent(new CustomEvent('yab-page-result',{detail:JSON.stringify({callId:request.callId,error:String(error&&error.message||error)})})));
+        });
+      }
+    """#
+    /// The page's transport: the world's bridge answers through the
+    /// document, and the calls it brings back arrive as events too.
+    static let pageTransport = #"""
+      const nonce='page';
+      const ready=Promise.resolve(true);
+      const relayIn=false;
+      const pending=new Map();let callSerial=0;
+      const call=(op,args)=>new Promise((resolve,reject)=>{
+        const callId='page'+(++callSerial);pending.set(callId,{resolve,reject});
+        document.dispatchEvent(new CustomEvent('yab-page-call',{detail:JSON.stringify({callId,op,args:plain(args)})}));
+        setTimeout(()=>{if(pending.delete(callId))reject(Error('The extension page bridge did not answer'))},15000);
+      });
+      document.addEventListener('yab-page-result',event=>{
+        let answer;try{answer=JSON.parse(event.detail)}catch(error){return}
+        const entry=pending.get(answer.callId);if(!entry)return;pending.delete(answer.callId);
+        answer.error?entry.reject(Error(answer.error)):entry.resolve(answer.value);
+      });
+      document.addEventListener('yab-page-incoming',event=>{
+        let request;try{request=JSON.parse(event.detail)}catch(error){return}
+        globalThis.__yabWK.receive(request.op,request.args);
+      });
+    """#
+    static func bootstrap(_ config: [String: Any], page: Bool = false) throws -> String {
+        try shim.replacingOccurrences(of: "__TRANSPORT__", with: page ? pageTransport : worldTransport)
+            .replacingOccurrences(of: "__CONFIG__", with: json(config))
     }
     static func matches(_ pattern: String, url: URL) -> Bool {
         guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let host = url.host?.lowercased() else { return false }

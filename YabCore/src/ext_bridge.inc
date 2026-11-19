@@ -144,12 +144,22 @@ static void ExtensionWithWorker(Tab& control, NSString* extension, std::function
     });
   });
 }
-static NSString* ExtensionRead(NSString* root, NSString* relative) {
+static NSString* ExtensionResolved(NSString* root, NSString* relative) {
   if(!relative.length||[relative isAbsolutePath])return nil;
   NSString* base=root.stringByResolvingSymlinksInPath, *file=[[root stringByAppendingPathComponent:relative] stringByResolvingSymlinksInPath];
   if(![file hasPrefix:[base stringByAppendingString:@"/"]])return nil;
-  NSDictionary* attributes=[NSFileManager.defaultManager attributesOfItemAtPath:file error:nil];if([attributes fileSize]>2*1024*1024)return nil;
+  NSDictionary* attributes=[NSFileManager.defaultManager attributesOfItemAtPath:file error:nil];
+  return [attributes fileSize]>2*1024*1024?nil:file;
+}
+static NSString* ExtensionRead(NSString* root, NSString* relative) {
+  NSString* file=ExtensionResolved(root,relative);if(!file)return nil;
   return [NSString stringWithContentsOfFile:file encoding:NSUTF8StringEncoding error:nil];
+}
+// An image or a font is not text: the bridge carries it base64-wrapped,
+// with the same root and size checks as the text read.
+static NSData* ExtensionReadData(NSString* root, NSString* relative) {
+  NSString* file=ExtensionResolved(root,relative);if(!file)return nil;
+  return [NSData dataWithContentsOfFile:file];
 }
 // Worker session -> a release in flight (1), another owed after it (2).
 static std::map<std::string, int> extensionConsoleRelease;
@@ -298,7 +308,7 @@ static bool ExtensionBridgeCommand(Tab& tab, NSString* method, NSDictionary* p, 
   if([method isEqual:@"ext.bridge.files"]){
     if(![p[@"files"] isKindOfClass:NSArray.class]||[p[@"files"] count]>128){Reply(request,nil,@"Invalid extension file list");return true;}
     NSMutableDictionary* files=[NSMutableDictionary new];NSString* root=extensionRoots[@(profile.c_str())][extension];
-    for(id path in p[@"files"]){if(![path isKindOfClass:NSString.class]){Reply(request,nil,@"Invalid extension file");return true;}NSString* source=ExtensionRead(root,path);if(!source){Reply(request,nil,@"Extension file is missing or outside its root");return true;}files[path]=source;}
+    for(id path in p[@"files"]){if(![path isKindOfClass:NSString.class]){Reply(request,nil,@"Invalid extension file");return true;}NSString* source=ExtensionRead(root,path);if(!source){NSData* raw=ExtensionReadData(root,path);if(raw)source=[NSString stringWithFormat:@"{\"b64\":\"%@\"}",[raw base64EncodedStringWithOptions:0]];}if(!source){Reply(request,nil,@"Extension file is missing or outside its root");return true;}files[path]=source;}
     Reply(request,files);return true;
   }
   if([method isEqual:@"ext.bridge.reply"]){

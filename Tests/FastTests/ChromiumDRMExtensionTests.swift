@@ -91,10 +91,82 @@ struct ChromiumDRMExtensionTests {
         #expect(ChromiumDRMResources.pattern("overlay/menu.html", covers: "overlay/menu.html"))
         #expect(ChromiumDRMResources.pattern("fonts/*.ttf", covers: "fonts/inter.ttf"))
         #expect(ChromiumDRMResources.pattern("popup/fonts/*", covers: "popup/fonts/inter.woff2"))
+        #expect(ChromiumDRMResources.pattern("overlay/*/menu*.html", covers: "overlay/x/menuy.html"))
+        #expect(ChromiumDRMResources.pattern("popup/fonts/*", covers: "popup/fonts/"))
+        #expect(!ChromiumDRMResources.pattern("overlay/*/menu*.html", covers: "overlay/menu.html"))
         #expect(!ChromiumDRMResources.pattern("overlay/menu.html", covers: "background.js"))
         #expect(!ChromiumDRMResources.pattern("popup/fonts/*", covers: "popup/fonts.js"))
         #expect(!ChromiumDRMResources.pattern("fonts/*.ttf", covers: "fonts/inter.woff2"))
         #expect(!ChromiumDRMResources.pattern("overlay/menu.html", covers: "overlay/menu.html.js"))
+    }
+
+    @Test func base64WrappedAssetsServeAsBytes() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let wrapped = "{\"b64\":\"\(png.base64EncodedString())\"}"
+        #expect(ChromiumDRMResources.bytes(from: wrapped) == png)
+        #expect(ChromiumDRMResources.bytes(from: "plain text file") == nil)
+        #expect(ChromiumDRMResources.bytes(from: "{\"b64\":\"not base64!\"}") == nil)
+    }
+
+    @Test func theInjectedBootstrapLandsInsideTheHead() {
+        let page = "<!doctype html><html><head><title>x</title></head><body></body></html>"
+        let served = String(decoding: ChromiumDRMResources.inject("globalThis.witness=true;", into: Data(page.utf8))!, as: UTF8.self)
+        #expect(served.contains("<head><script>globalThis.witness=true;</script><title>x</title>"))
+        let headless = "<!doctype html><html><body><p>hi</p></body></html>"
+        let servedHeadless = String(decoding: ChromiumDRMResources.inject("globalThis.witness=true;", into: Data(headless.utf8))!, as: UTF8.self)
+        #expect(servedHeadless.hasPrefix("<!doctype html><script>globalThis.witness=true;</script><html>"))
+        let bare = "just text"
+        let servedBare = String(decoding: ChromiumDRMResources.inject("x", into: Data(bare.utf8))!, as: UTF8.self)
+        #expect(servedBare.hasPrefix("<script>x</script>"))
+    }
+
+    /// An extension's served page talks to its own isolated world over the
+    /// document they share: the world answers the page's calls and brings
+    /// the calls the background sends back.
+    @Test func servedPagesGetTheirAPIThroughTheDocumentRelay() throws {
+        let id = "nngceckbapebfimnlniiiahkandclblb"
+        let document = """
+            globalThis.CustomEvent = class { constructor(type, options) { this.type = type; this.detail = options && options.detail; } };
+            globalThis.document = { listeners: {},
+              addEventListener(name, fn) { (this.listeners[name] ??= []).push(fn); },
+              dispatchEvent(event) { for (const fn of this.listeners[event.type] || []) fn(event); return true; } };
+            """
+        var world = try #require(JSContext())
+        world.evaluateScript(document + """
+            globalThis.location = {href: 'chrome-extension://\(id)/overlay/menu.html', protocol: 'chrome-extension:'};
+            globalThis.crypto = {randomUUID: () => 'nonce'};
+            globalThis.replies = [];
+            globalThis.webkit = {messageHandlers: {yabChromiumExtension: {
+                postMessage: body => new Promise(resolve => { replies.push(body); resolve('en-US'); })
+            }}};
+            """)
+        world.evaluateScript(try ChromiumDRMExtensionScripts.bootstrap(["id": id, "epoch": "test"]))
+        world.evaluateScript("""
+            globalThis.answer = null;
+            document.addEventListener('yab-page-result', event => { answer = JSON.parse(event.detail); });
+            document.dispatchEvent(new CustomEvent('yab-page-call', {detail: JSON.stringify({callId: 'x', op: 'i18n.getUILanguage', args: []})}));
+            """)
+        world.evaluateScript("1")
+        #expect(world.exception == nil, Comment(rawValue: world.exception?.toString() ?? ""))
+        #expect(world.evaluateScript("answer.callId === 'x' && answer.value === 'en-US'")?.toBool() == true)
+
+        var page = try #require(JSContext())
+        page.evaluateScript(document + """
+            globalThis.location = {href: 'chrome-extension://\(id)/overlay/menu.html', protocol: 'chrome-extension:'};
+            globalThis.calls = [];
+            document.addEventListener('yab-page-call', event => {
+              const request = JSON.parse(event.detail); calls.push(request.op);
+              document.dispatchEvent(new CustomEvent('yab-page-result', {detail: JSON.stringify({callId: request.callId, value: 'witness-answer'})}));
+            });
+            """)
+        page.evaluateScript(try ChromiumDRMExtensionScripts.bootstrap(["id": id, "epoch": "test"], page: true))
+        page.evaluateScript("""
+            globalThis.outcome = {};
+            browser.runtime.sendMessage('witness').then(value => outcome = {value}, error => outcome = {error: String(error)});
+            """)
+        page.evaluateScript("1")
+        #expect(page.exception == nil, Comment(rawValue: page.exception?.toString() ?? ""))
+        #expect(page.evaluateScript("outcome.value === 'witness-answer' && calls[0] === 'runtime.sendMessage'")?.toBool() == true)
     }
 
     /// The bridge shim YabCore injects into an extension's Chromium worker.
