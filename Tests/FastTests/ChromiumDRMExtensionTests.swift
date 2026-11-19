@@ -7,6 +7,162 @@ import YabCoreClient
 
 @Suite @MainActor
 struct ChromiumDRMExtensionTests {
+    @Test func contentScriptsCanResolveExtensionURLsThroughBrowserRuntime() throws {
+        let context = try #require(JSContext())
+        context.evaluateScript("""
+            globalThis.location = {href: 'https://example.test/login'};
+            globalThis.crypto = {randomUUID: () => 'nonce'};
+            globalThis.webkit = {messageHandlers: {yabChromiumExtension: {
+                postMessage: () => Promise.resolve()
+            }}};
+            """)
+        let id = "nngceckbapebfimnlniiiahkandclblb"
+        context.evaluateScript(try ChromiumDRMExtensionScripts.bootstrap(["id": id, "epoch": "test"]))
+        let result = context.evaluateScript("""
+            typeof browser !== 'undefined' && browser.runtime === chrome.runtime
+                && browser.runtime.getURL('overlay/menu.html')
+            """)
+        #expect(context.exception == nil)
+        #expect(result?.toString() == "chrome-extension://\(id)/overlay/menu.html")
+        let surface = context.evaluateScript("""
+            browser.storage === chrome.storage && browser.i18n === chrome.i18n
+                && browser.tabs === undefined
+            """)
+        #expect(surface?.toBool() == true)
+    }
+    @Test func contentBridgeDeliversNotificationsWithoutRequiringAReply() throws {
+        let context = try #require(JSContext())
+        context.evaluateScript("""
+            globalThis.location = {href: 'https://example.test/login'};
+            globalThis.crypto = {randomUUID: () => 'nonce'};
+            globalThis.clearTimeout = () => {};
+            globalThis.webkit = {messageHandlers: {yabChromiumExtension: {
+                postMessage: () => Promise.resolve()
+            }}};
+            """)
+        context.evaluateScript(try ChromiumDRMExtensionScripts.bootstrap(["id": "test", "epoch": "test"]))
+        context.evaluateScript("""
+            globalThis.result = {};
+            const send = message => __yabWK.receive('tabs.sendMessage', {message});
+            (async () => {
+              try { await send('missing'); } catch (error) { result.missing = error.message; }
+              browser.runtime.onMessage.addListener((message, _, reply) => {
+                if (message === 'notify') result.delivered = true;
+                else reply('answer');
+              });
+              result.notification = await send('notify');
+              result.reply = await send('request');
+            })();
+            """)
+        #expect(context.exception == nil)
+        #expect(context.evaluateScript("result.missing")?.toString() == "Receiving end does not exist")
+        #expect(context.evaluateScript("result.delivered && result.notification === null")?.toBool() == true)
+        #expect(context.evaluateScript("result.reply")?.toString() == "answer")
+    }
+
+    /// The bootstrap's gate: the extension's own pages get the API world,
+    /// another extension's pages get nothing, and a web page needs a grant.
+    @Test func pageGuardAdmitsOnlyTheExtensionsOwnPagesAndGrantedSites() throws {
+        let id = "nngceckbapebfimnlniiiahkandclblb"
+        let guardSource = try ChromiumDRMExtensionScripts.pageGuard(id: id, grants: ["http://127.0.0.1/*"])
+        func witness(_ href: String) throws -> Bool? {
+            let context = try #require(JSContext())
+            context.evaluateScript("""
+                globalThis.URL = class { constructor(href) {
+                    const match = /^([a-z][a-z0-9+.-]*):\\/\\/([^\\/?#]*)([^?#]*)/.exec(href) || [];
+                    this.protocol = match[1] ? match[1] + ':' : '';
+                    this.host = match[2] || ''; this.hostname = (match[2] || '').split(':')[0];
+                    this.pathname = match[3] || ''; this.search = '';
+                } };
+                globalThis.location = (() => { const parsed = new URL(\(try ChromiumDRMExtensionScripts.json(href)));
+                    return {href: \(try ChromiumDRMExtensionScripts.json(href)), protocol: parsed.protocol, host: parsed.host}; })();
+                """)
+            _ = context.evaluateScript("(()=>{\(guardSource)globalThis.witness=true;})()")
+            #expect(context.exception == nil, Comment(rawValue: context.exception?.toString() ?? ""))
+            return context.evaluateScript("witness === true")?.toBool()
+        }
+        #expect(try witness("chrome-extension://\(id)/overlay/menu.html") == true)
+        #expect(try witness("chrome-extension://otherextension/overlay/menu.html") == false)
+        #expect(try witness("http://127.0.0.1:18205/login") == true)
+        #expect(try witness("https://github.com/login") == false)
+    }
+
+    @Test func accessibleResourcePatternsCoverOnlyWhatTheExtensionDeclared() {
+        #expect(ChromiumDRMResources.pattern("overlay/menu.html", covers: "overlay/menu.html"))
+        #expect(ChromiumDRMResources.pattern("fonts/*.ttf", covers: "fonts/inter.ttf"))
+        #expect(ChromiumDRMResources.pattern("popup/fonts/*", covers: "popup/fonts/inter.woff2"))
+        #expect(!ChromiumDRMResources.pattern("overlay/menu.html", covers: "background.js"))
+        #expect(!ChromiumDRMResources.pattern("popup/fonts/*", covers: "popup/fonts.js"))
+        #expect(!ChromiumDRMResources.pattern("fonts/*.ttf", covers: "fonts/inter.woff2"))
+        #expect(!ChromiumDRMResources.pattern("overlay/menu.html", covers: "overlay/menu.html.js"))
+    }
+
+    /// The bridge shim YabCore injects into an extension's Chromium worker.
+    /// Its runtime.sendMessage mirrors Chrome: no listener rejects, a listener
+    /// that answers settles the reply, one that only handles the message
+    /// resolves null, and one that returns true keeps the channel open until
+    /// it replies, with the wait timer cleared on every settlement.
+    @Test func workerBridgeSettlesEveryListenerOutcome() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("YabCore/src/ext_bridge_worker.inc"), encoding: .utf8)
+        let start = try #require(source.range(of: #"@R"JS("#)?.upperBound)
+        let end = try #require(source.range(of: #")JS""#, range: start..<source.endIndex)?.lowerBound)
+        let context = try #require(JSContext())
+        context.evaluateScript("""
+            globalThis.__yabExtensionBridge = () => {};
+            globalThis.timers = new Map();
+            globalThis.setTimeout = fn => { timers.set(timers.size + 1, fn); return timers.size; };
+            globalThis.clearTimeout = id => { timers.delete(id); };
+            let handler = null, notified = 0;
+            globalThis.chrome = {
+              tabs: {sendMessage() {}, connect() {}, get() {}, query() {}},
+              runtime: {onMessage: {
+                hasListeners: () => handler !== null,
+                dispatch(message, sender, reply) {
+                  const result = handler?.(message, reply);
+                  return result === undefined ? undefined : {results: [result]};
+                }
+              }}
+            };
+            """)
+        context.evaluateScript(String(source[start..<end]))
+        context.evaluateScript("""
+            globalThis.outcome = {};
+            const send = message => __yabWKBridge.invoke('runtime.sendMessage', [message], null)
+              .then(value => ({value}), error => ({error: String(error.message)}));
+            (async () => {
+              outcome.missing = await send('missing');
+              handler = (message, reply) => {
+                if (message === 'notify') { notified += 1; return; }
+                reply({notified});
+              };
+              outcome.notification = await send('notify');
+              outcome.witness = await send('witness');
+              outcome.done = true;
+            })();
+            """)
+        #expect(context.exception == nil)
+        #expect(context.evaluateScript("JSON.stringify(outcome.missing)")?.toString() == #"{"error":"Receiving end does not exist"}"#)
+        #expect(context.evaluateScript("JSON.stringify(outcome.notification)")?.toString() == #"{"value":null}"#)
+        #expect(context.evaluateScript("JSON.stringify(outcome.witness)")?.toString() == #"{"value":{"notified":1}}"#)
+        #expect(context.evaluateScript("outcome.done === true && notified === 1")?.toBool() == true)
+        // A listener that returns true holds the reply open: nothing settles
+        // before it answers, and answering clears the armed wait timer.
+        context.evaluateScript("""
+            let lateReply = null, lateSettled = null;
+            handler = (message, reply) => { lateReply = reply; return true; };
+            __yabWKBridge.invoke('runtime.sendMessage', ['late'], null)
+              .then(value => lateSettled = {value}, error => lateSettled = {error: String(error.message)});
+            globalThis.late = {reply: () => lateReply('answered'), settled: () => lateSettled};
+            """)
+        #expect(context.exception == nil)
+        #expect(context.evaluateScript("timers.size === 1 && late.settled() === null")?.toBool() == true)
+        context.evaluateScript("late.reply()")
+        #expect(context.exception == nil)
+        #expect(context.evaluateScript("JSON.stringify(late.settled())")?.toString() == #"{"value":"answered"}"#)
+        #expect(context.evaluateScript("timers.size === 0")?.toBool() == true)
+    }
+
     @Test func grantAndManifestGuardsComposeWithoutLexicalRedeclarations() throws {
         let grant = try ChromiumDRMExtensionScripts.guardSource(matches: ["http://127.0.0.1/*"], excludes: [], globs: [], excludeGlobs: [])
         let manifest = try ChromiumDRMExtensionScripts.guardSource(matches: ["<all_urls>"], excludes: ["https://private.test/*"], globs: [], excludeGlobs: [])

@@ -23,9 +23,28 @@ enum ChromiumDRMExtensionScripts {
       const storage={onChanged:event()};for(const area of ['local','sync','session','managed']){storage[area]={onChanged:event()};for(const method of ['get','set','remove','clear','getBytesInUse'])storage[area][method]=(...args)=>{const cb=typeof args.at(-1)==='function'?args.pop():null;return callback(call('storage.'+area+'.'+method,args),cb)}}
       const i18n={getUILanguage:()=>config.language,getMessage:(name,substitutions=[])=>{const entry=config.messages[name]||config.messages[String(name).toLowerCase()];if(!entry)return '';const substitutionsArray=[substitutions].flat();return String(entry.message||'').replace(/\$([\w]+)\$/g,(_,key)=>entry.placeholders?.[key.toLowerCase()]?.content||'').replace(/\$(\d)/g,(_,i)=>substitutionsArray[Number(i)-1]||'').replace(/\$\$/g,'$')}};
       for(const method of ['getAcceptLanguages','detectLanguage'])i18n[method]=(...args)=>{const cb=typeof args.at(-1)==='function'?args.pop():null;return callback(call('i18n.'+method,args),cb)};
-      globalThis.chrome={runtime,storage,i18n};
+      // Some extensions choose the browser namespace on WebKit's Safari user agent.
+      globalThis.browser=globalThis.chrome={runtime,storage,i18n};
       const receive=async(op,args)=>{
-        if(op==='tabs.sendMessage')return new Promise((resolve,reject)=>{let answered=false,async=false;const done=v=>{if(!answered){answered=true;resolve(v??null)}};for(const f of runtime.onMessage.listeners){try{const value=f(args.message,{id:config.id},done);if(value===true)async=true;else if(value&&typeof value.then==='function'){async=true;value.then(done,reject)}}catch(e){reject(e)}}if(!answered&&!async)reject(Error('Receiving end does not exist'));else if(!answered)setTimeout(()=>reject(Error('Content script did not reply')),10000)});
+        if(op==='tabs.sendMessage')return new Promise((resolve,reject)=>{
+          const listeners=[...runtime.onMessage.listeners];
+          if(!listeners.length){reject(Error('Receiving end does not exist'));return}
+          let answered=false,async=false,timeout;
+          const settle=(complete,value)=>{if(answered)return;answered=true;clearTimeout(timeout);complete(value)};
+          const done=value=>settle(resolve,value??null);
+          for(const listener of listeners){
+            try{
+              const value=listener(args.message,{id:config.id},done);
+              if(value===true)async=true;
+              else if(value&&typeof value.then==='function'){
+                async=true;Promise.resolve(value).then(done,error=>settle(reject,error));
+              }
+            }catch(error){settle(reject,error)}
+          }
+          if(answered)return;
+          if(!async){done(null);return}
+          timeout=setTimeout(()=>settle(reject,Error('Content script did not reply')),10000);
+        });
         if(op==='tabs.connect'){const p=port(args.port,args.info?.name||'',{id:config.id});runtime.onConnect.listeners.forEach(f=>f(p));return null}
         if(op==='port.message'){const p=ports.get(args.port);if(!p)throw Error('Port is disconnected');p.onMessage.listeners.forEach(f=>f(args.message,p));return null}
         if(op==='port.disconnect'){const p=ports.get(args.port);ports.delete(args.port);p?.onDisconnect.listeners.forEach(f=>f(p));return null}
@@ -36,6 +55,14 @@ enum ChromiumDRMExtensionScripts {
     })();
     """#
 
+    /// The bootstrap's own gate. A page's address decides whether the
+    /// extension's API world exists there at all: the extension's own pages
+    /// get it (as an extension's pages do in Chrome), any other extension's
+    /// page gets nothing, and a web page needs a site grant.
+    static func pageGuard(id: String, grants: [String]) throws -> String {
+        "if(location.protocol==='chrome-extension:'){if(location.host!==\(try json(id)))return;}"
+        + "else{\(try guardSource(matches: grants, excludes: [], globs: [], excludeGlobs: []))}"
+    }
     static func json(_ value: Any) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys])
         return String(decoding: data, as: UTF8.self)

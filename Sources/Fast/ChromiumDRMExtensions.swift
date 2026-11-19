@@ -176,7 +176,7 @@ final class ChromiumDRMExtensions {
     private var epoch = UUID().uuidString
     private var scripts: [WKUserScript] = []
     private var handlers: [String: Handler] = [:]
-    private var entries: [String: [String: Any]] = [:]
+    private(set) var entries: [String: [String: Any]] = [:]
     private var documents: [String: Document] = [:]
     private var nextFrame = 0
     private var rules: [String: WKContentRuleList] = [:]
@@ -255,7 +255,7 @@ final class ChromiumDRMExtensions {
             controller.addScriptMessageHandler(handler, contentWorld: world(id), name: "yabChromiumExtension")
             let grants = entry["grants"] as? [String] ?? []
             let config: [String: Any] = ["id": id, "epoch": epoch, "manifest": manifest, "messages": entry["messages"] ?? [:], "language": Locale.current.identifier.replacingOccurrences(of: "_", with: "-")]
-            let bootstrap = "(()=>{\(try ChromiumDRMExtensionScripts.guardSource(matches: grants, excludes: [], globs: [], excludeGlobs: []))\(try ChromiumDRMExtensionScripts.bootstrap(config))})();"
+            let bootstrap = "(()=>{\(try ChromiumDRMExtensionScripts.pageGuard(id: id, grants: grants))\(try ChromiumDRMExtensionScripts.bootstrap(config))})();"
             add(bootstrap, time: .atDocumentStart, main: false, world: world(id), controller: controller)
             for script in manifest["content_scripts"] as? [[String: Any]] ?? [] {
                 let matches = script["matches"] as? [String] ?? [], excludes = script["exclude_matches"] as? [String] ?? []
@@ -319,15 +319,27 @@ final class ChromiumDRMExtensions {
     }
     private func world(_ id: String) -> WKContentWorld { .world(name: "yab-chromium-extension-" + id) }
     private func allowed(_ id: String, _ url: URL) -> Bool {
-        (entries[id]?["grants"] as? [String] ?? []).contains { ChromiumDRMExtensionScripts.matches($0, url: url) }
+        // An extension's own pages are its own trust domain, as in Chrome;
+        // every other address needs a site grant.
+        url.scheme == "chrome-extension" && url.host == id
+            || (entries[id]?["grants"] as? [String] ?? []).contains { ChromiumDRMExtensionScripts.matches($0, url: url) }
+    }
+    /// The native registry keeps grants over http and https pages. An
+    /// extension's own page registers as the page embedding it, so the
+    /// bridge's virtual document stays grant-checked, while scripts inside
+    /// the page keep their real address.
+    private func registerURL(_ url: URL) -> URL {
+        url.scheme == "chrome-extension" ? web?.url ?? url : url
     }
     private func message(_ id: String, _ message: WKScriptMessage) async throws -> Any {
         guard let tab, !tab.gone, tab.chromiumProfile == session.profile, message.webView === web,
               let body = message.body as? [String: Any], body["epoch"] as? String == epoch,
               let nonce = body["nonce"] as? String, let requestURL = message.frameInfo.request.url,
               let url = (body["url"] as? String).flatMap(URL.init(string:)) ?? Optional(requestURL), allowed(id, url),
-              url.scheme == message.frameInfo.securityOrigin.protocol, url.host == message.frameInfo.securityOrigin.host,
-              (url.port ?? (url.scheme == "https" ? 443 : 80)) == (message.frameInfo.securityOrigin.port == 0 ? (url.scheme == "https" ? 443 : 80) : message.frameInfo.securityOrigin.port) else { throw YabCoreError.remote("Extension document permission or identity expired") }
+              url.scheme == "chrome-extension" ? requestURL.scheme == "chrome-extension" && requestURL.host == url.host
+              : url.scheme == message.frameInfo.securityOrigin.protocol && url.host == message.frameInfo.securityOrigin.host
+                && (url.port ?? (url.scheme == "https" ? 443 : 80)) == (message.frameInfo.securityOrigin.port == 0 ? (url.scheme == "https" ? 443 : 80) : message.frameInfo.securityOrigin.port)
+        else { throw YabCoreError.remote("Extension document permission or identity expired") }
         let key = id + ":" + nonce
         if body["op"] as? String == "hello" {
             // WebKit says nothing when a frame goes, so a page open all day
@@ -341,7 +353,7 @@ final class ChromiumDRMExtensions {
             let frame: Int
             if message.frameInfo.isMainFrame { frame = 0 } else { nextFrame += 1; frame = nextFrame }
             let document = Document(id: message.frameInfo.isMainFrame ? epoch : UUID().uuidString, nonce: nonce, frame: frame, info: message.frameInfo, url: url, epoch: epoch)
-            let result = try await session.request("ext.bridge.register", ["virtual": tab.id.uuidString, "document": document.id, "frame": frame, "url": url.absoluteString, "topURL": message.frameInfo.isMainFrame ? url.absoluteString : (web?.url?.absoluteString ?? url.absoluteString)])
+            let result = try await session.request("ext.bridge.register", ["virtual": tab.id.uuidString, "document": document.id, "frame": frame, "url": registerURL(url).absoluteString, "topURL": message.frameInfo.isMainFrame ? registerURL(url).absoluteString : (web?.url?.absoluteString ?? url.absoluteString)])
             guard body["epoch"] as? String == epoch else { throw CancellationError() }
             number = result["tabId"].number.map(Int.init); documents[key] = document
             return true
@@ -351,7 +363,7 @@ final class ChromiumDRMExtensions {
         // URL text from that world may update only within WKFrameInfo's native origin.
         if document.url != url {
             document = Document(id: document.id, nonce: nonce, frame: document.frame, info: message.frameInfo, url: url, epoch: epoch)
-            _ = try await session.request("ext.bridge.register", ["virtual": tab.id.uuidString, "document": document.id, "frame": document.frame, "url": url.absoluteString, "topURL": message.frameInfo.isMainFrame ? url.absoluteString : (web?.url?.absoluteString ?? url.absoluteString)])
+            _ = try await session.request("ext.bridge.register", ["virtual": tab.id.uuidString, "document": document.id, "frame": document.frame, "url": registerURL(url).absoluteString, "topURL": message.frameInfo.isMainFrame ? registerURL(url).absoluteString : (web?.url?.absoluteString ?? url.absoluteString)])
             guard document.epoch == epoch else { throw CancellationError() }
             documents[key] = document
         }

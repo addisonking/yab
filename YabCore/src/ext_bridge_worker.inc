@@ -24,7 +24,20 @@ static NSString* ExtensionWorkerShim = @R"JS((()=>{
   async invoke(op,args,sender,access){
    if(access)for(const [area,allowed]of Object.entries(access))storageAccess.set(area,allowed?'TRUSTED_AND_UNTRUSTED_CONTEXTS':'TRUSTED_CONTEXTS');
    if(sender)slots.set(sender.tab.id,sender);
-   if(op==='runtime.sendMessage')return new Promise((resolve,reject)=>{let answered=false;const done=v=>{if(!answered){answered=true;resolve(v??null)}};const result=native.runtime.onMessage.dispatch(args[0],sender,done);const results=result?.results||[];const promises=results.filter(x=>x&&typeof x.then==='function');for(const p of promises)Promise.resolve(p).then(done,reject);if(!answered&&!results.includes(true)&&!promises.length)reject(Error('Receiving end does not exist'));else if(!answered)setTimeout(()=>reject(Error('Background did not reply')),11000)});
+   if(op==='runtime.sendMessage')return new Promise((resolve,reject)=>{
+    const onMessage=native.runtime.onMessage;
+    if(!onMessage.hasListeners()){reject(Error('Receiving end does not exist'));return}
+    let answered=false,timeout;
+    const settle=(complete,value)=>{if(answered)return;answered=true;clearTimeout(timeout);complete(value)};
+    const done=value=>settle(resolve,value??null);
+    const results=onMessage.dispatch(args[0],sender,done)?.results||[];
+    const promises=results.filter(value=>value&&typeof value.then==='function');
+    for(const promise of promises)Promise.resolve(promise).then(done,error=>settle(reject,error));
+    if(answered)return;
+    // A listener can handle a notification without sending a response.
+    if(!results.includes(true)&&!promises.length){done(null);return}
+    timeout=setTimeout(()=>settle(reject,Error('Background did not reply')),11000);
+   });
    if(op==='runtime.connect'){const p=makePort(args.port,args.name||'',sender);native.runtime.onConnect.dispatch(p);return null}
    if(op==='port.message'){const p=ports.get(args.port);if(!p)throw Error('Port is disconnected');p.onMessage.dispatch(args.message,p);return null}
    if(op==='port.disconnect'){const p=ports.get(args.port);ports.delete(args.port);p?.onDisconnect.dispatch(p);return null}
