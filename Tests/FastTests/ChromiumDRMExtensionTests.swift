@@ -153,6 +153,7 @@ struct ChromiumDRMExtensionTests {
         var page = try #require(JSContext())
         page.evaluateScript(document + """
             globalThis.location = {href: 'chrome-extension://\(id)/overlay/menu.html', protocol: 'chrome-extension:'};
+            globalThis.crypto = {getRandomValues: values => values.fill(1)};
             globalThis.calls = [];
             document.addEventListener('yab-page-call', event => {
               const request = JSON.parse(event.detail); calls.push(request.op);
@@ -167,6 +168,30 @@ struct ChromiumDRMExtensionTests {
         page.evaluateScript("1")
         #expect(page.exception == nil, Comment(rawValue: page.exception?.toString() ?? ""))
         #expect(page.evaluateScript("outcome.value === 'witness-answer' && calls[0] === 'runtime.sendMessage'")?.toBool() == true)
+    }
+
+    @Test func servedPagesUseDistinctWorkerPortIDs() throws {
+        let bootstrap = try ChromiumDRMExtensionScripts.bootstrap(["id": "test", "epoch": "test"], page: true)
+        func firstPort(in page: Int) throws -> String {
+            let context = try #require(JSContext())
+            context.evaluateScript("""
+                globalThis.crypto = {getRandomValues: values => values.fill(\(page))};
+                globalThis.CustomEvent = class { constructor(type, options) { this.detail = options.detail; } };
+                globalThis.document = {
+                  addEventListener() {},
+                  dispatchEvent(event) { globalThis.request = JSON.parse(event.detail); }
+                };
+                globalThis.setTimeout = () => {};
+                """)
+            context.evaluateScript(bootstrap)
+            context.evaluateScript("browser.runtime.connect({name:'inline menu'});")
+            #expect(context.exception == nil, Comment(rawValue: context.exception?.toString() ?? ""))
+            #expect(context.evaluateScript("request.op === 'runtime.connect'")?.toBool() == true)
+            return try #require(context.evaluateScript("request.args.port")?.toString())
+        }
+        let first = try firstPort(in: 1)
+        let second = try firstPort(in: 2)
+        #expect(first != second)
     }
 
     /// The bridge shim YabCore injects into an extension's Chromium worker.

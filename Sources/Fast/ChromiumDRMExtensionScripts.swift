@@ -87,7 +87,8 @@ enum ChromiumDRMExtensionScripts {
     /// The page's transport: the world's bridge answers through the
     /// document, and the calls it brings back arrive as events too.
     static let pageTransport = #"""
-      const nonce='page';
+      // getRandomValues is available on extension pages outside secure contexts too.
+      const nonce=crypto.getRandomValues(new Uint32Array(4)).join('-');
       const ready=Promise.resolve(true);
       const relayIn=false;
       const pending=new Map();let callSerial=0;
