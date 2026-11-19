@@ -30,6 +30,28 @@ struct ChromiumDRMExtensionTests {
             """)
         #expect(surface?.toBool() == true)
     }
+    @Test func runtimeUsesTheDynamicHostOnlyForDeclaredPaths() throws {
+        let id = "nngceckbapebfimnlniiiahkandclblb"
+        let host = "b717ee02-dd48-4113-9625-eb266617c65a"
+        let context = try #require(JSContext())
+        context.evaluateScript("""
+            globalThis.location = {href: 'https://example.test/login'};
+            globalThis.crypto = {randomUUID: () => 'nonce'};
+            globalThis.webkit = {messageHandlers: {yabChromiumExtension: {postMessage: async () => true}}};
+            globalThis.URL = class {
+                constructor(url) { this.pathname = url.slice(url.indexOf('/', 19)).split(/[?#]/)[0]; }
+            };
+            """)
+        context.evaluateScript(try ChromiumDRMExtensionScripts.bootstrap([
+            "id": id, "epoch": "test", "resourceHost": host, "dynamicResources": ["overlay/*.html"],
+        ]))
+        #expect(context.exception == nil)
+        #expect(context.evaluateScript("browser.runtime.getURL('/overlay/menu.html?x#y')")?.toString()
+                == "chrome-extension://\(host)/overlay/menu.html?x#y")
+        #expect(context.evaluateScript("browser.runtime.getURL('background.js')")?.toString()
+                == "chrome-extension://\(id)/background.js")
+        #expect(context.evaluateScript("browser.runtime.getURL('')")?.toString() == "chrome-extension://\(id)/")
+    }
     @Test func contentBridgeDeliversNotificationsWithoutRequiringAReply() throws {
         let context = try #require(JSContext())
         context.evaluateScript("""
@@ -65,7 +87,7 @@ struct ChromiumDRMExtensionTests {
     @Test func pageGuardAdmitsOnlyTheExtensionsOwnPagesAndGrantedSites() throws {
         let id = "nngceckbapebfimnlniiiahkandclblb"
         let guardSource = try ChromiumDRMExtensionScripts.pageGuard(id: id, grants: ["http://127.0.0.1/*"])
-        func witness(_ href: String) throws -> Bool? {
+        func witness(_ href: String, opaque: Bool = false) throws -> Bool? {
             let context = try #require(JSContext())
             context.evaluateScript("""
                 globalThis.URL = class { constructor(href) {
@@ -76,15 +98,49 @@ struct ChromiumDRMExtensionTests {
                 } };
                 globalThis.location = (() => { const parsed = new URL(\(try ChromiumDRMExtensionScripts.json(href)));
                     return {href: \(try ChromiumDRMExtensionScripts.json(href)), protocol: parsed.protocol, host: parsed.host}; })();
+                globalThis.window = {origin: \(opaque) ? 'null' : location.protocol + '//' + location.host};
                 """)
             _ = context.evaluateScript("(()=>{\(guardSource)globalThis.witness=true;})()")
             #expect(context.exception == nil, Comment(rawValue: context.exception?.toString() ?? ""))
             return context.evaluateScript("witness === true")?.toBool()
         }
         #expect(try witness("chrome-extension://\(id)/overlay/menu.html") == true)
+        #expect(try witness("chrome-extension://\(id)/overlay/menu.html", opaque: true) == false)
         #expect(try witness("chrome-extension://otherextension/overlay/menu.html") == false)
         #expect(try witness("http://127.0.0.1:18205/login") == true)
         #expect(try witness("https://github.com/login") == false)
+    }
+
+    @Test func dynamicResourceAccessRequiresTheCurrentOwnerAndDeclaredURLForm() throws {
+        let id = "nngceckbapebfimnlniiiahkandclblb"
+        let other = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        let host = "b717ee02-dd48-4113-9625-eb266617c65a"
+        let entries = [id: ["resourceHost": host], other: ["resourceHost": "191eb7cd-93e5-4680-b81d-72d1fa868022"]]
+        let manifest: [String: Any] = [
+            "web_accessible_resources": [
+                ["resources": ["/overlay/menu*.html"], "matches": ["https://example.test/*"], "use_dynamic_url": true],
+                ["resources": ["overlay/icon.png"], "matches": ["https://example.test/*"]],
+            ],
+            "sandbox": ["pages": ["overlay/menu*.html"]],
+        ]
+        let site = try #require(URL(string: "https://example.test/login"))
+        let excluded = try #require(URL(string: "https://excluded.test/login"))
+        let extensionPage = try #require(URL(string: "chrome-extension://\(id)/frame.html"))
+        let foreignPage = try #require(URL(string: "chrome-extension://\(other)/frame.html"))
+        #expect(ChromiumDRMResources.owner(for: host, entries: entries) == id)
+        #expect(ChromiumDRMResources.owner(for: host, entries: [other: entries[other]!]) == nil)
+        #expect(ChromiumDRMResources.owner(for: host, entries: [id: entries[id]!, other: entries[id]!]) == nil)
+        #expect(ChromiumDRMResources.permits("overlay/menu-list.html", dynamic: true, owner: id, asker: site, manifest: manifest))
+        #expect(!ChromiumDRMResources.permits("overlay/menu-list.html", dynamic: false, owner: id, asker: site, manifest: manifest))
+        #expect(!ChromiumDRMResources.permits("overlay/menu-list.html", dynamic: true, owner: id, asker: excluded, manifest: manifest))
+        #expect(!ChromiumDRMResources.permits("overlay/menu-list.html", dynamic: true, owner: id, asker: foreignPage, manifest: manifest))
+        #expect(!ChromiumDRMResources.permits("background.js", dynamic: true, owner: id, asker: extensionPage, manifest: manifest))
+        #expect(ChromiumDRMResources.permits("background.js", dynamic: false, owner: id, asker: extensionPage, manifest: manifest))
+        #expect(ChromiumDRMResources.permits("overlay/icon.png", dynamic: false, owner: id, asker: site, manifest: manifest))
+        let policy = ChromiumDRMResources.sandboxPolicy("overlay/menu-list.html", owner: id, manifest: manifest)
+        #expect(policy?.hasPrefix("sandbox allow-scripts") == true)
+        #expect(policy?.contains("script-src chrome-extension://\(id)") == true)
+        #expect(ChromiumDRMResources.sandboxPolicy("overlay/frame.html", owner: id, manifest: manifest) == nil)
     }
 
     @Test func accessibleResourcePatternsCoverOnlyWhatTheExtensionDeclared() {
@@ -199,20 +255,26 @@ struct ChromiumDRMExtensionTests {
     /// that answers settles the reply, one that only handles the message
     /// resolves null, and one that returns true keeps the channel open until
     /// it replies, with the wait timer cleared on every settlement.
-    @Test func workerBridgeSettlesEveryListenerOutcome() throws {
+    @Test func workerBridgeSettlesMessagesAndQueriesTheSelectedTab() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("YabCore/src/ext_bridge_worker.inc"), encoding: .utf8)
         let start = try #require(source.range(of: #"@R"JS("#)?.upperBound)
         let end = try #require(source.range(of: #")JS""#, range: start..<source.endIndex)?.lowerBound)
         let context = try #require(JSContext())
         context.evaluateScript("""
-            globalThis.__yabExtensionBridge = () => {};
+            globalThis.selectedTab = null;
+            globalThis.__yabExtensionBridge = raw => {
+                const call = JSON.parse(raw);
+                if (call.op === 'tabs.active') __yabWKBridge.reply(call.id, selectedTab);
+            };
             globalThis.timers = new Map();
             globalThis.setTimeout = fn => { timers.set(timers.size + 1, fn); return timers.size; };
             globalThis.clearTimeout = id => { timers.delete(id); };
-            let handler = null, notified = 0;
+            let handler = null, notified = 0, updates = [];
             globalThis.chrome = {
-              tabs: {sendMessage() {}, connect() {}, get() {}, query() {}},
+              tabs: {sendMessage() {}, connect() {}, get() {}, query: async () => [{id: 1}],
+                onUpdated: {dispatch(id, change) { updates.push([id, change.url]); }}},
+              windows: {WINDOW_ID_CURRENT: -2},
               runtime: {onMessage: {
                 hasListeners: () => handler !== null,
                 dispatch(message, sender, reply) {
@@ -258,6 +320,39 @@ struct ChromiumDRMExtensionTests {
         #expect(context.exception == nil)
         #expect(context.evaluateScript("JSON.stringify(late.settled())")?.toString() == #"{"value":"answered"}"#)
         #expect(context.evaluateScript("timers.size === 0")?.toBool() == true)
+
+        context.evaluateScript("""
+            (async () => {
+              handler = () => {};
+              const post = (id, frameId, documentId) =>
+                __yabWKBridge.invoke('runtime.sendMessage', ['notify'], {
+                  frameId, documentId, tab: {id, active: true, url: 'https://example.test/login', windowId: 1}
+                });
+              selectedTab = 100;
+              for (const [id, frame, doc] of [
+                [100, 1, 'child'], [100, 0, 'main'], [100, 0, 'main'], [101, 0, 'other']
+              ]) {
+                await post(id, frame, doc);
+              }
+              const query = filter => chrome.tabs.query({active: true, ...filter}).then(rows => rows.map(row => row.id));
+              outcome.currentWindow = await query({currentWindow: true});
+              outcome.currentWindowID = await query({windowId: -2});
+              outcome.excluded = await query({currentWindow: true, url: 'https://elsewhere.test/*'});
+              await __yabWKBridge.invoke('forget', 100, null);
+              await post(100, 0, 'next');
+              selectedTab = 0;
+              outcome.unaddressable = await query({currentWindow: true});
+              selectedTab = null;
+              outcome.native = await query({currentWindow: true});
+            })();
+            """)
+        #expect(context.exception == nil)
+        #expect(context.evaluateScript("JSON.stringify(outcome.currentWindow)")?.toString() == "[100]")
+        #expect(context.evaluateScript("JSON.stringify(outcome.currentWindowID)")?.toString() == "[100]")
+        #expect(context.evaluateScript("JSON.stringify(outcome.excluded)")?.toString() == "[]")
+        #expect(context.evaluateScript("JSON.stringify(outcome.unaddressable)")?.toString() == "[]")
+        #expect(context.evaluateScript("JSON.stringify(outcome.native)")?.toString() == "[1]")
+        #expect(context.evaluateScript("JSON.stringify(updates)")?.toString() == #"[[100,"https://example.test/login"],[100,"https://example.test/login"]]"#)
     }
 
     @Test func grantAndManifestGuardsComposeWithoutLexicalRedeclarations() throws {

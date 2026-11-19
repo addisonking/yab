@@ -13,7 +13,15 @@ enum ChromiumDRMExtensionScripts {
       const plain=\#(WebKitIPCBoundary.plainScript);
       __TRANSPORT__
       const event=()=>{const listeners=new Set();return {addListener:f=>listeners.add(f),removeListener:f=>listeners.delete(f),hasListener:f=>listeners.has(f),hasListeners:()=>!!listeners.size,listeners}};
-      const runtime={id:config.id,getManifest:()=>config.manifest,getURL:path=>'chrome-extension://'+config.id+'/'+String(path||'').replace(/^\//,''),onMessage:event(),onConnect:event()};
+      const base='chrome-extension://'+config.id;
+      const dynamicPatterns=(config.dynamicResources||[]).map(pattern=>new RegExp('^'+pattern.split('*').map(part=>part.replace(/[.+?^$(){}|[\]\\]/g,'\\$&')).join('.*')+'$'));
+      const getURL=path=>{
+        const relative='/'+String(path||'').replace(/^\//,'');
+        if(config.resourceHost&&dynamicPatterns.some(pattern=>pattern.test(new URL(base+relative).pathname.slice(1))))
+          return 'chrome-extension://'+config.resourceHost+relative;
+        return base+relative;
+      };
+      const runtime={id:config.id,getManifest:()=>config.manifest,getURL,onMessage:event(),onConnect:event()};
       const callback=(promise,cb)=>{if(typeof cb!=='function')return promise;promise.then(x=>cb(x),e=>{runtime.lastError={message:String(e.message||e)};try{cb()}finally{delete runtime.lastError}})};
       runtime.sendMessage=(...args)=>{const cb=typeof args.at(-1)==='function'?args.pop():null;if(args.length>1&&typeof args[0]==='string'&&/^[a-p]{32}$/.test(args[0])){if(args.shift()!==config.id)return callback(Promise.reject(Error('Cross-extension messaging is unavailable')),cb)}return callback(call('runtime.sendMessage',[args[0]]),cb)};
       const port=(id,name,sender)=>{const p={name,sender,onMessage:event(),onDisconnect:event(),postMessage:message=>{call('port.message',{port:id,message}).catch(()=>p.onDisconnect.listeners.forEach(f=>f(p)))},disconnect:()=>{ports.delete(id);call('port.disconnect',{port:id});p.onDisconnect.listeners.forEach(f=>f(p))}};ports.set(id,p);return p};
@@ -59,8 +67,14 @@ enum ChromiumDRMExtensionScripts {
     /// get it (as an extension's pages do in Chrome), any other extension's
     /// page gets nothing, and a web page needs a site grant.
     static func pageGuard(id: String, grants: [String]) throws -> String {
-        "if(location.protocol==='chrome-extension:'){if(location.host!==\(try json(id)))return;}"
+        "if(location.protocol==='chrome-extension:'){if(window.origin!==\(try json("chrome-extension://" + id)))return;}"
         + "else{\(try guardSource(matches: grants, excludes: [], globs: [], excludeGlobs: []))}"
+    }
+    static func dynamicResources(_ manifest: [String: Any]) -> [String] {
+        (manifest["web_accessible_resources"] as? [[String: Any]] ?? [])
+            .filter { $0["use_dynamic_url"] as? Bool == true }
+            .flatMap { $0["resources"] as? [String] ?? [] }
+            .map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
     }
     static func json(_ value: Any) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys])

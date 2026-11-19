@@ -32,37 +32,38 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         // holds requests still being answered.
         defer { stopped.remove(ObjectIdentifier(task)) }
         guard let url = task.request.url, url.scheme?.lowercased() == "chrome-extension", let id = url.host, !id.isEmpty,
+              url.user == nil, url.password == nil, url.port == nil,
               url.path.count > 1, !url.path.contains("..") else { return fail(task) }
         let path = String(url.path.dropFirst())
-        // The frame asking for the file, not the page on top of it: an
-        // allowed site must not lend its permission to a frame from a site
-        // the extension left out. WebKit names the asking frame in the
-        // Referer it sends; without one, only the top page is left to
-        // answer for the request.
+        // Use the asking frame. WebKit omits Referer for extension
+        // subresources, but still identifies their committed document.
+        let frame = Self.frame(task)
         let asker = task.request.value(forHTTPHeaderField: "Referer").flatMap(URL.init(string:))
+            ?? Self.committedExtensionURL(frame)
             ?? task.request.mainDocumentURL ?? webView.url
         // A main frame is its own document, and main frames are not served
         // here: a page can't walk itself into an extension's pages, the way
         // Chrome refuses the web that address.
         guard let page = asker, page != url,
               let tab = Extensions.shared.tab(showing: webView), let bridge = tab.chromiumDRMExtensions,
-              let entry = bridge.entries[id], let manifest = entry["manifest"] as? [String: Any] else { return fail(task) }
+              let owner = Self.owner(for: id, entries: bridge.entries),
+              let manifest = bridge.entries[owner]?["manifest"] as? [String: Any] else { return fail(task) }
+        let dynamic = id != owner
+        let sandboxAsset = !dynamic && Self.sandboxAsset(path, owner: owner, frame: frame, manifest: manifest)
+        guard sandboxAsset || Self.permits(path, dynamic: dynamic, owner: owner, asker: page, manifest: manifest) else { return fail(task) }
         let session = bridge.session
-        if page.scheme?.lowercased() == "chrome-extension" {
-            // One of the extension's own pages chaining to another.
-            guard page.host == id else { return fail(task) }
-        } else {
-            guard ["http", "https"].contains(page.scheme?.lowercased() ?? "") else { return fail(task) }
-            var accessible = false
-            for group in manifest["web_accessible_resources"] as? [[String: Any]] ?? [] {
-                let resources = group["resources"] as? [String] ?? [], matches = group["matches"] as? [String] ?? []
-                if matches.contains(where: { ChromiumDRMExtensionScripts.matches($0, url: page) }),
-                   resources.contains(where: { Self.pattern($0, covers: path) }) { accessible = true; break }
-            }
-            guard accessible else { return fail(task) }
+        let epoch = bridge.epoch
+        // A reload can retire a dynamic ID even when the manifest and extension ID stay the same.
+        if dynamic, (try? await session.dynamicResourceHost(owner)) != id { return fail(task) }
+        guard let reply = try? await session.request("ext.bridge.files", ["extension": owner, "files": [path]]),
+              let source = reply[path].string, bridge.epoch == epoch, live(task) else { return fail(task) }
+        var servedURL = url
+        if dynamic {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return fail(task) }
+            components.host = owner
+            guard let canonical = components.url, Self.redirect(task, from: url, to: canonical) else { return fail(task) }
+            servedURL = canonical
         }
-        guard let reply = try? await session.request("ext.bridge.files", ["extension": id, "files": [path]]),
-              let source = reply[path].string, live(task) else { return fail(task) }
         // Text arrives as it is; anything the native read could not decode
         // (an image, a font) arrives base64-wrapped.
         let body = Self.bytes(from: source) ?? Data(source.utf8)
@@ -72,11 +73,15 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         // runtime; the bridge then holds every message to WebKit's own word
         // for which frame sent it.
         var document = body
-        if Self.mime(path).hasPrefix("text/html"), let bootstrap = bridge.pageBootstrap(for: id) {
+        var headers = ["Content-Type": Self.mime(path), "Access-Control-Allow-Origin": "*"]
+        if dynamic { headers["Cache-Control"] = "no-store" }
+        if sandboxAsset { headers["Access-Control-Allow-Origin"] = nil }
+        if let policy = Self.sandboxPolicy(path, owner: owner, manifest: manifest) {
+            headers["Content-Security-Policy"] = policy
+        } else if Self.mime(path).hasPrefix("text/html"), let bootstrap = bridge.pageBootstrap(for: owner) {
             document = Self.inject(bootstrap, into: body) ?? body
         }
-        guard let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
-                                             headerFields: ["Content-Type": Self.mime(path), "Access-Control-Allow-Origin": "*"]),
+        guard let response = HTTPURLResponse(url: servedURL, statusCode: 200, httpVersion: nil, headerFields: headers),
               live(task) else { return fail(task) }
         task.didReceive(response)
         guard live(task) else { return }
@@ -87,6 +92,69 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         guard live(task) else { return }
         task.didFailWithError(YabCoreError.remote("Extension resource is unavailable to this page"))
         stopped.insert(ObjectIdentifier(task))
+    }
+    static func owner(for host: String, entries: [String: [String: Any]]) -> String? {
+        if entries[host] != nil { return host }
+        let owners = entries.keys.filter { entries[$0]?["resourceHost"] as? String == host }
+        return owners.count == 1 ? owners.first : nil
+    }
+    static func permits(_ path: String, dynamic: Bool, owner: String, asker: URL, manifest: [String: Any]) -> Bool {
+        if asker.scheme == "chrome-extension" {
+            return asker.host == owner && asker.port == nil
+                && (!dynamic || ChromiumDRMExtensionScripts.dynamicResources(manifest).contains { pattern($0, covers: path) })
+        }
+        let groups = manifest["web_accessible_resources"] as? [[String: Any]] ?? []
+        return groups.contains { group in
+            (group["use_dynamic_url"] as? Bool == true) == dynamic
+                && (group["matches"] as? [String] ?? []).contains { ChromiumDRMExtensionScripts.matches($0, url: asker) }
+                && (group["resources"] as? [String] ?? []).contains {
+                    pattern($0.hasPrefix("/") ? String($0.dropFirst()) : $0, covers: path)
+                }
+        }
+    }
+    static func sandboxed(_ path: String, manifest: [String: Any]) -> Bool {
+        let pages = (manifest["sandbox"] as? [String: Any])?["pages"] as? [String] ?? []
+        return pages.contains { pattern($0.hasPrefix("/") ? String($0.dropFirst()) : $0, covers: path) }
+    }
+    static func sandboxPolicy(_ path: String, owner: String, manifest: [String: Any]) -> String? {
+        guard sandboxed(path, manifest: manifest) else { return nil }
+        let policy = (manifest["content_security_policy"] as? [String: String])?["sandbox"] ?? "script-src 'self'; object-src 'none'"
+        // WebKit matches 'self' against the sandbox's opaque origin. Chromium
+        // uses the owning extension for resource policies, while keeping the
+        // sandbox opaque for script and messaging.
+        return "sandbox allow-scripts, " + policy.replacingOccurrences(
+            of: #"(?<!\S)'self'(?=\s|;|$)"#, with: "chrome-extension://" + owner, options: .regularExpression)
+    }
+    private static func frame(_ task: WKURLSchemeTask) -> WKFrameInfo? {
+        let selector = NSSelectorFromString("_frame")
+        guard let object = task as? NSObject, object.responds(to: selector) else { return nil }
+        return object.perform(selector)?.takeUnretainedValue() as? WKFrameInfo
+    }
+    private static func committedExtensionURL(_ frame: WKFrameInfo?) -> URL? {
+        guard let frame, !frame.isMainFrame, let url = frame.request.url,
+              let host = url.host, url.scheme == "chrome-extension", url.port == nil,
+              frame.securityOrigin.protocol == url.scheme, frame.securityOrigin.host == host,
+              frame.securityOrigin.port == 0 else { return nil }
+        return url
+    }
+    private static func sandboxAsset(_ path: String, owner: String, frame: WKFrameInfo?, manifest: [String: Any]) -> Bool {
+        // Only WebKit's committed sandbox document proves who requested a
+        // subresource. There is no Referer from an opaque origin.
+        guard let frame, !frame.isMainFrame, frame.securityOrigin.protocol.isEmpty,
+              let url = frame.request.url, url.scheme == "chrome-extension", url.host == owner,
+              url.port == nil, sandboxed(String(url.path.dropFirst()), manifest: manifest) else { return false }
+        let type = mime(path)
+        return type.hasPrefix("text/javascript") || type.hasPrefix("text/css")
+    }
+    // Sending a response with a different URL leaves WebKit's document at the
+    // alias. Report the redirect so the extension keeps its canonical origin.
+    private static func redirect(_ task: WKURLSchemeTask, from alias: URL, to canonical: URL) -> Bool {
+        let selector = NSSelectorFromString("_didPerformRedirection:newRequest:")
+        guard let object = task as? NSObject, object.responds(to: selector),
+              let response = HTTPURLResponse(url: alias, statusCode: 307, httpVersion: nil,
+                                             headerFields: ["Location": canonical.absoluteString, "Cache-Control": "no-store"]) else { return false }
+        object.perform(selector, with: response, with: NSURLRequest(url: canonical))
+        return true
     }
     /// A web-accessible entry's pattern: every `*` stands for any run of
     /// characters, including none.
