@@ -34,17 +34,14 @@ struct ChromiumPopupTextInputTests {
         }
     }
 
-    /// The same rule as a page's: an input method composes only in a field,
-    /// and ⌘ keys stay commands.
-    @MainActor @Test func composesOnlyInAField() throws {
+    /// Plain typing and composition use the input context in text fields.
+    @MainActor @Test func editablePopupKeysUseTheInputContext() throws {
         let key = try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
             windowNumber: 0, context: nil, characters: "k", charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40))
-        let kotoeri = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
-        #expect(ChromiumPage.usesInputContext(key, source: kotoeri, marked: false, editable: true))
-        #expect(!ChromiumPage.usesInputContext(key, source: kotoeri, marked: false, editable: false))
-        #expect(!ChromiumPage.usesInputContext(key, source: "com.apple.keylayout.ABC", marked: false, editable: true))
+        #expect(ChromiumPage.usesInputContext(key, marked: false, editable: true))
+        #expect(!ChromiumPage.usesInputContext(key, marked: false, editable: false))
         let command = try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
             windowNumber: 0, context: nil, characters: "v", charactersIgnoringModifiers: "v", isARepeat: false, keyCode: 9))
-        #expect(!ChromiumPage.usesInputContext(command, source: kotoeri, marked: true, editable: true))
+        #expect(!ChromiumPage.usesInputContext(command, marked: true, editable: true))
     }
 }
