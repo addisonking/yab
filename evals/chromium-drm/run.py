@@ -33,6 +33,19 @@ class Pages(http.server.BaseHTTPRequestHandler):
         self.referrers[self.path] = self.headers.get('Referer')
         if self.path == '/blocked-by-extension.js':
             body, mime = b'globalThis.blockedScriptLoaded = true;', 'text/javascript'
+        elif self.path.startswith('/extension-embedder?'):
+            body = b'''<!doctype html><meta name="referrer" content="no-referrer">
+<script>
+const frame = document.createElement('iframe');
+frame.src = new URLSearchParams(location.search).get('resource');
+let loaded = false;
+addEventListener('message', event => {
+    if (event.source === frame.contentWindow && event.data === 'extension-resource') loaded = true;
+});
+setTimeout(() => parent.postMessage({extensionResourceLoaded: loaded}, '*'), 1500);
+document.documentElement.append(frame);
+</script>'''
+            mime = 'text/html; charset=utf-8'
         elif self.path == '/tone.wav':
             stream = io.BytesIO()
             with wave.open(stream, 'wb') as wav:
@@ -65,6 +78,24 @@ keySystemConfiguration:{keySystem:'com.widevine.alpha'}}),500)}
 
     def log_message(self, *_):
         pass
+
+
+def resource_probe(site, extension_id):
+    return f'''const resource = {json.dumps(f'chrome-extension://{extension_id}/resource.html')};
+    const allowed = {json.dumps(site)};
+    const probe = origin => new Promise(resolve => {{
+        const frame = document.createElement('iframe');
+        const timer = setTimeout(() => finish(null), 5000);
+        const finish = value => {{ clearTimeout(timer); removeEventListener('message', receive); frame.remove(); resolve(value); }};
+        const receive = event => {{
+            if (event.source === frame.contentWindow && event.origin === origin &&
+                typeof event.data?.extensionResourceLoaded === 'boolean') finish(event.data.extensionResourceLoaded);
+        }};
+        addEventListener('message', receive);
+        frame.src = origin + '/extension-embedder?resource=' + encodeURIComponent(resource);
+        document.body.append(frame);
+    }});
+    return Promise.all([probe(allowed), probe(allowed.replace('127.0.0.1', 'localhost'))]);'''
 
 
 def run(app, out, site, cookies=True, extensions=True):
@@ -191,6 +222,9 @@ def run(app, out, site, cookies=True, extensions=True):
             checks['extension_same_document_url'] = spa['documentId'] == sender['documentId'] and spa['tab']['id'] == sender['tab']['id'] and spa['url'] == site + '/eme#bridge-spa' and spa['tab']['url'] == spa['url']
             checks['extension_isolated'] = script(tab, 'return typeof globalThis.bridgeResult') == 'undefined'
             checks['extension_handler_isolated'] = script(tab, 'return typeof window.webkit?.messageHandlers?.yabChromiumExtension') == 'undefined'
+            allowed, excluded = script(tab, resource_probe(site, extension_id))
+            checks['extension_resource_with_no_referrer'] = allowed is True
+            checks['extension_resource_excluded_embedder'] = excluded is False
             events = ask(do='chromium-drm', id=tab, op='extension-script', extension=extension_id, body='return globalThis.bridgeEvents')['value']
             checks['extension_storage_event'] = any(e.get('area') == 'local' and e.get('changes', {}).get('witness', {}).get('newValue') == result['nonce'] for e in events)
             blocked = script(tab, "return await new Promise(resolve=>{const s=document.createElement('script');s.src='/blocked-by-extension.js';s.onload=()=>resolve(false);s.onerror=()=>resolve(true);document.head.append(s)})")

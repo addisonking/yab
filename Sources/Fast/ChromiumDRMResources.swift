@@ -33,24 +33,20 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         defer { stopped.remove(ObjectIdentifier(task)) }
         guard let url = task.request.url, url.scheme?.lowercased() == "chrome-extension", let id = url.host, !id.isEmpty,
               url.user == nil, url.password == nil, url.port == nil,
-              url.path.count > 1, !url.path.contains("..") else { return fail(task) }
-        let path = String(url.path.dropFirst())
-        // Use the asking frame. WebKit omits Referer for extension
-        // subresources, but still identifies their committed document.
-        let frame = Self.frame(task)
-        let asker = task.request.value(forHTTPHeaderField: "Referer").flatMap(URL.init(string:))
-            ?? Self.committedExtensionURL(frame)
-            ?? task.request.mainDocumentURL ?? webView.url
-        // A main frame is its own document, and main frames are not served
-        // here: a page can't walk itself into an extension's pages, the way
-        // Chrome refuses the web that address.
-        guard let page = asker, page != url,
+              url.path.count > 1, !url.path.contains(".."),
               let tab = Extensions.shared.tab(showing: webView), let bridge = tab.chromiumDRMExtensions,
               let owner = Self.owner(for: id, entries: bridge.entries),
-              let manifest = bridge.entries[owner]?["manifest"] as? [String: Any] else { return fail(task) }
+              let manifest = bridge.entries[owner]?["manifest"] as? [String: Any],
+              let frame = Self.frame(task) else { return fail(task) }
+        let path = String(url.path.dropFirst())
+        let frameID = Self.frameID(frame)
+        let navigation = frameID.flatMap { bridge.takeResourceNavigation(frame: $0, url: url) }
+        let asker = navigation ?? Self.committedURL(frame)
         let dynamic = id != owner
-        let sandboxAsset = !dynamic && Self.sandboxAsset(path, owner: owner, frame: frame, manifest: manifest)
-        guard sandboxAsset || Self.permits(path, dynamic: dynamic, owner: owner, asker: page, manifest: manifest) else { return fail(task) }
+        let sandboxAsset = navigation == nil && !dynamic && Self.sandboxAsset(path, owner: owner, frame: frame, manifest: manifest)
+        guard sandboxAsset || (asker.map {
+            $0 != url && Self.permits(path, dynamic: dynamic, owner: owner, asker: $0, manifest: manifest)
+        } ?? false) else { return fail(task) }
         let session = bridge.session
         let epoch = bridge.epoch
         // A reload can retire a dynamic ID even when the manifest and extension ID stay the same.
@@ -61,7 +57,11 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         if dynamic {
             guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return fail(task) }
             components.host = owner
-            guard let canonical = components.url, Self.redirect(task, from: url, to: canonical) else { return fail(task) }
+            guard let canonical = components.url else { return fail(task) }
+            if navigation != nil, let frameID {
+                bridge.recordResourceNavigation(frame: frameID, url: canonical, source: nil)
+            }
+            guard Self.redirect(task, from: url, to: canonical) else { return fail(task) }
             servedURL = canonical
         }
         // Text arrives as it is; anything the native read could not decode
@@ -130,11 +130,37 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         guard let object = task as? NSObject, object.responds(to: selector) else { return nil }
         return object.perform(selector)?.takeUnretainedValue() as? WKFrameInfo
     }
-    private static func committedExtensionURL(_ frame: WKFrameInfo?) -> URL? {
-        guard let frame, !frame.isMainFrame, let url = frame.request.url,
-              let host = url.host, url.scheme == "chrome-extension", url.port == nil,
-              frame.securityOrigin.protocol == url.scheme, frame.securityOrigin.host == host,
-              frame.securityOrigin.port == 0 else { return nil }
+    // Navigation policy supplies the native source for a new child frame.
+    // The scheme task identifies its target, which may still be opaque.
+    static func recordNavigation(_ action: WKNavigationAction, in webView: WKWebView) -> Bool {
+        guard let bridge = Extensions.shared.tab(showing: webView)?.chromiumDRMExtensions,
+              let url = action.request.url, let target = action.targetFrame else { return true }
+        let frame = frameID(target)
+        let redirected = frame.map { bridge.clearResourceNavigation(frame: $0, redirectingTo: url) } ?? false
+        guard url.scheme == "chrome-extension", let host = url.host,
+              owner(for: host, entries: bridge.entries) != nil else { return true }
+        guard !target.isMainFrame else { return false }
+        // The same scheme task sends the canonical redirect and the response.
+        if redirected { return true }
+        guard let frame, let sourceFrame = WindowGate.source(action),
+              let source = committedURL(sourceFrame) else { return false }
+        bridge.recordResourceNavigation(frame: frame, url: url, source: source)
+        return true
+    }
+    private static func frameID(_ frame: WKFrameInfo) -> UInt64? {
+        let selector = NSSelectorFromString("_handle")
+        guard frame.responds(to: selector),
+              let handle = frame.perform(selector)?.takeUnretainedValue() as? NSObject,
+              handle.responds(to: NSSelectorFromString("frameID")) else { return nil }
+        return (handle.value(forKey: "frameID") as? NSNumber)?.uint64Value
+    }
+    private static func committedURL(_ frame: WKFrameInfo) -> URL? {
+        guard let url = frame.request.url, let host = url.host, let scheme = url.scheme,
+              ["http", "https", "chrome-extension"].contains(scheme),
+              frame.securityOrigin.protocol == scheme, frame.securityOrigin.host == host else { return nil }
+        let defaultPort = scheme == "https" ? 443 : scheme == "http" ? 80 : 0
+        let port = frame.securityOrigin.port
+        guard (url.port ?? defaultPort) == (port == 0 ? defaultPort : port) else { return nil }
         return url
     }
     private static func sandboxAsset(_ path: String, owner: String, frame: WKFrameInfo?, manifest: [String: Any]) -> Bool {

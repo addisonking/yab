@@ -235,6 +235,7 @@ final class ChromiumDRMExtensions {
     private var handlers: [String: Handler] = [:]
     private(set) var entries: [String: [String: Any]] = [:]
     private var documents: [String: Document] = [:]
+    private var resourceNavigations: [UInt64: (url: URL, source: URL?)] = [:]
     private var nextFrame = 0
     private var rules: [String: WKContentRuleList] = [:]
     private(set) var number: Int?
@@ -246,6 +247,19 @@ final class ChromiumDRMExtensions {
     static let answerLimit = 8 * 1024 * 1024
     static let changeLimit = 256 * 1024
     private struct Document { let id: String; let nonce: String; let frame: Int; let info: WKFrameInfo; let url: URL; let epoch: String }
+    func recordResourceNavigation(frame: UInt64, url: URL, source: URL?) {
+        if resourceNavigations.count >= 128 { resourceNavigations.removeAll() }
+        resourceNavigations[frame] = (url, source)
+    }
+    func clearResourceNavigation(frame: UInt64, redirectingTo url: URL) -> Bool {
+        guard let pending = resourceNavigations.removeValue(forKey: frame) else { return false }
+        return pending.source == nil && pending.url == url
+    }
+    func takeResourceNavigation(frame: UInt64, url: URL) -> URL? {
+        guard let pending = resourceNavigations[frame], pending.url == url, let source = pending.source else { return nil }
+        resourceNavigations[frame] = nil
+        return source
+    }
     final class Handler: NSObject, WKScriptMessageHandlerWithReply {
         weak var owner: ChromiumDRMExtensions?
         let extensionID: String
@@ -296,6 +310,7 @@ final class ChromiumDRMExtensions {
         guard !tab.gone, tab.chromiumProfile == session.profile else { throw CancellationError() }
         _ = try await session.request("ext.bridge.unregister", ["virtual": tab.id.uuidString])
         documents = [:]; nextFrame = 0
+        resourceNavigations.removeAll()
         let controller = web.configuration.userContentController
         let revision = Self.revision(catalog)
         if revision == installed, scripts.allSatisfy({ mine in controller.userScripts.contains { $0 === mine } }) {
@@ -556,11 +571,13 @@ final class ChromiumDRMExtensions {
         installed = nil
         epoch = UUID().uuidString
         documents = [:]
+        resourceNavigations.removeAll()
         number = nil
     }
     func detach() {
         installed = nil
         epoch = UUID().uuidString; documents = [:]
+        resourceNavigations.removeAll()
         if let tab {
             session.pages[tab.id] = nil
             let identity = tab.id.uuidString
