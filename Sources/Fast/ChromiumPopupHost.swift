@@ -440,7 +440,7 @@ struct ChromiumPopupAnchor: NSViewRepresentable {
 }
 
 @MainActor
-private final class ChromiumPopupInput: NSView, NSTextInputClient {
+class ChromiumPopupInput: NSView, NSTextInputClient {
     weak var popup: ChromiumExtensionPopup? {
         didSet {
             popup?.onTextInput = { [weak self] in
