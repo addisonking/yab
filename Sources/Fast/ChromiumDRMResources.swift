@@ -73,12 +73,16 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         // runtime; the bridge then holds every message to WebKit's own word
         // for which frame sent it.
         var document = body
-        var headers = ["Content-Type": Self.mime(path), "Access-Control-Allow-Origin": "*"]
-        if dynamic { headers["Cache-Control"] = "no-store" }
-        if sandboxAsset { headers["Access-Control-Allow-Origin"] = nil }
+        let type = Self.mime(path)
+        var headers = ["Content-Type": type, "Access-Control-Allow-Origin": "*"]
+        if dynamic || sandboxAsset { headers["Cache-Control"] = "no-store" }
+        if sandboxAsset {
+            // Fonts load in CORS mode from the sandbox's opaque origin.
+            headers["Access-Control-Allow-Origin"] = type.hasPrefix("font/") ? "null" : nil
+        }
         if let policy = Self.sandboxPolicy(path, owner: owner, manifest: manifest) {
             headers["Content-Security-Policy"] = policy
-        } else if Self.mime(path).hasPrefix("text/html"), let bootstrap = bridge.pageBootstrap(for: owner) {
+        } else if type.hasPrefix("text/html"), let bootstrap = bridge.pageBootstrap(for: owner) {
             document = Self.inject(bootstrap, into: body) ?? body
         }
         guard let response = HTTPURLResponse(url: servedURL, statusCode: 200, httpVersion: nil, headerFields: headers),
@@ -171,6 +175,7 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
               url.port == nil, sandboxed(String(url.path.dropFirst()), manifest: manifest) else { return false }
         let type = mime(path)
         return type.hasPrefix("text/javascript") || type.hasPrefix("text/css")
+            || type.hasPrefix("image/") || type.hasPrefix("font/")
     }
     // Sending a response with a different URL leaves WebKit's document at the
     // alias. Report the redirect so the extension keeps its canonical origin.

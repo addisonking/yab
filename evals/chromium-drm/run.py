@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import struct
 import subprocess
 import sys
@@ -96,6 +97,21 @@ def resource_probe(site, extension_id):
         document.body.append(frame);
     }});
     return Promise.all([probe(allowed), probe(allowed.replace('127.0.0.1', 'localhost'))]);'''
+
+
+def sandbox_probe(extension_id):
+    return f'''const frame = document.createElement('iframe');
+    frame.src = {json.dumps(f'chrome-extension://{extension_id}/sandbox.html')};
+    return new Promise(resolve => {{
+        const timer = setTimeout(() => finish(null), 8000);
+        const finish = value => {{ clearTimeout(timer); removeEventListener('message', receive); frame.remove(); resolve(value); }};
+        const receive = event => {{
+            if (event.source === frame.contentWindow && event.data?.sandboxAssets)
+                finish({{origin: event.origin, ...event.data.sandboxAssets}});
+        }};
+        addEventListener('message', receive);
+        document.body.append(frame);
+    }});'''
 
 
 def run(app, out, site, cookies=True, extensions=True):
@@ -191,7 +207,10 @@ def run(app, out, site, cookies=True, extensions=True):
             cookie_checks = ask(do='chromium-drm', id=tab, op='cookies')['checks']
             checks.update(cookie_checks)
         if extensions:
-            folder = Path(__file__).resolve().parent / 'extension'
+            fixture = Path(__file__).resolve().parent
+            folder = out / 'extension'
+            shutil.copytree(fixture / 'extension', folder, dirs_exist_ok=True)
+            shutil.copyfile(fixture.parents[1] / 'Resources' / 'Caveat.ttf', folder / 'sandbox.ttf')
             installed = ask(do='chromium-drm', id=tab, op='extension-install', path=str(folder))['extensions']
             report['extension_catalog'] = installed
             if len(installed) != 1:
@@ -222,9 +241,6 @@ def run(app, out, site, cookies=True, extensions=True):
             checks['extension_same_document_url'] = spa['documentId'] == sender['documentId'] and spa['tab']['id'] == sender['tab']['id'] and spa['url'] == site + '/eme#bridge-spa' and spa['tab']['url'] == spa['url']
             checks['extension_isolated'] = script(tab, 'return typeof globalThis.bridgeResult') == 'undefined'
             checks['extension_handler_isolated'] = script(tab, 'return typeof window.webkit?.messageHandlers?.yabChromiumExtension') == 'undefined'
-            allowed, excluded = script(tab, resource_probe(site, extension_id))
-            checks['extension_resource_with_no_referrer'] = allowed is True
-            checks['extension_resource_excluded_embedder'] = excluded is False
             events = ask(do='chromium-drm', id=tab, op='extension-script', extension=extension_id, body='return globalThis.bridgeEvents')['value']
             checks['extension_storage_event'] = any(e.get('area') == 'local' and e.get('changes', {}).get('witness', {}).get('newValue') == result['nonce'] for e in events)
             blocked = script(tab, "return await new Promise(resolve=>{const s=document.createElement('script');s.src='/blocked-by-extension.js';s.onload=()=>resolve(false);s.onerror=()=>resolve(true);document.head.append(s)})")
@@ -241,6 +257,13 @@ def run(app, out, site, cookies=True, extensions=True):
             checks['extension_child_ports'] = child['portReply']['echo']['nonce'] == child['nonce'] and child['portReply']['document'] == child_sender['documentId']
             checks['extension_child_scripting'] = child['background']['scripted'][0]['frameId'] == 1 and child['background']['scripted'][0]['result'] == 'executed-in-webkit'
             capture(tab, '03-webkit-chromium-extension')
+            allowed, excluded = script(tab, resource_probe(site, extension_id))
+            checks['extension_resource_with_no_referrer'] = allowed is True
+            checks['extension_resource_excluded_embedder'] = excluded is False
+            sandbox = script(tab, sandbox_probe(extension_id))
+            report['states']['extension_sandbox'] = sandbox
+            checks['extension_sandbox_displays_own_assets'] = bool(sandbox and sandbox['image'] and sandbox['font'])
+            checks['extension_sandbox_stays_opaque'] = bool(sandbox and sandbox['origin'] == 'null' and not sandbox['runtime'])
         # Per-site choices use the public model through the isolated bench.
         # Keep the original local acceptance above intact, including its media,
         # cookies and extension witness on the Recommended fallback path.
