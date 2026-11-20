@@ -111,7 +111,22 @@ enum ChromiumDRMExtensionScripts {
     """#
     /// The page's transport: the world's bridge answers through the
     /// document, and the calls it brings back arrive as events too.
+    static let templateFetchHeader = "X-Yab-Extension-Template"
     static let pageTransport = #"""
+      // DOM navigations cannot set this header. The scheme handler still
+      // checks the request against the frame's native extension origin.
+      if(typeof globalThis.fetch==='function'){
+        const fetchResource=globalThis.fetch.bind(globalThis);
+        globalThis.fetch=async(input,init)=>{
+          const target=new URL(input instanceof Request?input.url:String(input),document.baseURI);
+          if(target.protocol!=='chrome-extension:'||target.host!==config.id||
+             target.username||target.password||!target.pathname.toLowerCase().endsWith('.html'))
+            return fetchResource(input,init);
+          const request=new Request(input,init);
+          if(request.method==='GET')request.headers.set('\#(templateFetchHeader)','1');
+          return fetchResource(request);
+        };
+      }
       // getRandomValues is available on extension pages outside secure contexts too.
       const nonce=crypto.getRandomValues(new Uint32Array(4)).join('-');
       const ready=Promise.resolve(true);

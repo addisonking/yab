@@ -3,7 +3,10 @@ if (location.hash === '#bridge' && globalThis.chrome?.runtime) {
   chrome.runtime.onMessage.addListener((message, _, reply) => {
     if (message.kind === 'resource-reply') reply('extension-page-reply');
   });
-  chrome.runtime.sendMessage({kind: 'resource-sender'}).then(
-    result => parent.postMessage({resourceBridge: result}, '*'),
+  Promise.all([
+    chrome.runtime.sendMessage({kind: 'resource-sender'}),
+    fetch('template.html').then(response => response.text()).catch(() => null),
+  ]).then(
+    ([result, template]) => parent.postMessage({resourceBridge: {...result, template}}, '*'),
     error => parent.postMessage({resourceBridge: {error: String(error)}}, '*'));
 }

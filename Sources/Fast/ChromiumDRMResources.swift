@@ -52,9 +52,11 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         case .stale: return fail(task)
         case .none:
             asker = Self.committedURL(frame)
-            // A site may fetch its declared HTML resources, but a committed
-            // extension document cannot authorize an unrecorded HTML load.
-            if asker?.scheme == "chrome-extension", Self.mime(path).hasPrefix("text/html") { return fail(task) }
+            if asker?.scheme == "chrome-extension", Self.mime(path).hasPrefix("text/html") {
+                guard asker?.host == owner, id == owner, task.request.httpMethod == "GET",
+                      task.request.value(forHTTPHeaderField: ChromiumDRMExtensionScripts.templateFetchHeader) == "1"
+                else { return fail(task) }
+            }
         }
         let dynamic = id != owner
         if navigated, path == Self.bootstrapPath { return fail(task) }
@@ -98,7 +100,10 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         var document = body
         let type = Self.mime(path)
         var headers = ["Content-Type": type, "Access-Control-Allow-Origin": "*"]
-        if dynamic || sandboxAsset { headers["Cache-Control"] = "no-store" }
+        // Keep fetched HTML out of the cache for future document navigations.
+        if dynamic || sandboxAsset || (!navigated && type.hasPrefix("text/html")) {
+            headers["Cache-Control"] = "no-store"
+        }
         if sandboxAsset {
             // Fonts load in CORS mode from the sandbox's opaque origin.
             headers["Access-Control-Allow-Origin"] = type.hasPrefix("font/") ? "null" : nil
@@ -113,7 +118,7 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
             // page's other restrictions, and a page that never declares a
             // policy keeps the protections Chrome would give it.
             headers["Content-Security-Policy"] = Self.pagePolicy(manifest)
-            if bridge.pageBootstrap(for: owner) != nil { document = Self.inject(into: body) ?? body }
+            if navigated, bridge.pageBootstrap(for: owner) != nil { document = Self.inject(into: body) ?? body }
         }
         guard let response = HTTPURLResponse(url: servedURL, statusCode: 200, httpVersion: nil, headerFields: headers),
               live(task) else { return fail(task) }

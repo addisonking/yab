@@ -284,6 +284,7 @@ def run(app, out, site, cookies=True, extensions=True):
             checks['extension_page_sender'] = (page_sender.get('url') == page_origin + '/resource.html#bridge'
                                                and page_sender.get('origin') == page_origin
                                                and page_sender.get('tab', {}).get('url') == site + '/eme')
+            checks['extension_template_fetch'] = (page_bridge or {}).get('template') == '<span>extension-template</span>\n'
             checks['extension_page_reply'] = (page_bridge or {}).get('reverse') == 'extension-page-reply'
             sandbox = script(tab, sandbox_probe(extension_id))
             report['states']['extension_sandbox'] = sandbox
