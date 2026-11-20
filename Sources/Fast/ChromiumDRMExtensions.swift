@@ -235,7 +235,7 @@ final class ChromiumDRMExtensions {
     private var handlers: [String: Handler] = [:]
     private(set) var entries: [String: [String: Any]] = [:]
     private var documents: [String: Document] = [:]
-    private var resourceNavigations: [UInt64: (url: URL, source: URL?)] = [:]
+    private var resourceNavigations = ResourceNavigations()
     private var nextFrame = 0
     private var rules: [String: WKContentRuleList] = [:]
     private(set) var number: Int?
@@ -248,17 +248,13 @@ final class ChromiumDRMExtensions {
     static let changeLimit = 256 * 1024
     private struct Document { let id: String; let nonce: String; let frame: Int; let info: WKFrameInfo; let url: URL; let epoch: String }
     func recordResourceNavigation(frame: UInt64, url: URL, source: URL?) {
-        if resourceNavigations.count >= 128 { resourceNavigations.removeAll() }
-        resourceNavigations[frame] = (url, source)
+        resourceNavigations.record(frame: frame, url: url, source: source)
     }
     func clearResourceNavigation(frame: UInt64, redirectingTo url: URL) -> Bool {
-        guard let pending = resourceNavigations.removeValue(forKey: frame) else { return false }
-        return pending.source == nil && pending.url == url
+        resourceNavigations.clear(frame: frame, redirectingTo: url)
     }
-    func takeResourceNavigation(frame: UInt64, url: URL) -> URL? {
-        guard let pending = resourceNavigations[frame], pending.url == url, let source = pending.source else { return nil }
-        resourceNavigations[frame] = nil
-        return source
+    func takeResourceNavigation(frame: UInt64, url: URL) -> ResourceNavigations.Answer {
+        resourceNavigations.take(frame: frame, url: url)
     }
     final class Handler: NSObject, WKScriptMessageHandlerWithReply {
         weak var owner: ChromiumDRMExtensions?
@@ -425,12 +421,19 @@ final class ChromiumDRMExtensions {
               }) else { return nil }
         return number
     }
-    /// The native registry keeps grants over http and https pages. An
-    /// extension's own page registers as the page embedding it, so the
-    /// bridge's virtual document stays grant-checked, while scripts inside
-    /// the page keep their real address.
-    private func registerURL(_ url: URL) -> URL {
-        url.scheme == "chrome-extension" ? web?.url ?? url : url
+    /// An extension's own page registers under its real chrome-extension
+    /// URL, the way Chrome reports sender.url. Cores from before the registry
+    /// took those URLs reject them, and the page embedding the frame stands
+    /// in for the sender there.
+    private func register(_ id: String, _ url: URL, document: Document, frame: Int, topURL: URL) async throws -> JSONValue {
+        func params(_ sender: URL) -> [String: Any] {
+            ["virtual": tab?.id.uuidString ?? "", "document": document.id, "frame": frame,
+             "url": sender.absoluteString, "topURL": topURL.absoluteString, "extension": id]
+        }
+        do { return try await session.request("ext.bridge.register", params(url)) }
+        catch YabCoreError.remote("Invalid virtual frame") where url.scheme == "chrome-extension" {
+            return try await session.request("ext.bridge.register", params(topURL))
+        }
     }
     /// A message's claimed address has to be the frame's own. WebKit tells
     /// the frame either through its request or its security origin; a page
@@ -471,7 +474,8 @@ final class ChromiumDRMExtensions {
             let frame: Int
             if message.frameInfo.isMainFrame { frame = 0 } else { nextFrame += 1; frame = nextFrame }
             let document = Document(id: message.frameInfo.isMainFrame ? epoch : UUID().uuidString, nonce: nonce, frame: frame, info: message.frameInfo, url: url, epoch: epoch)
-            let result = try await session.request("ext.bridge.register", ["virtual": tab.id.uuidString, "document": document.id, "frame": frame, "url": registerURL(url).absoluteString, "topURL": message.frameInfo.isMainFrame ? registerURL(url).absoluteString : (web?.url?.absoluteString ?? url.absoluteString)])
+            let result = try await register(id, url, document: document, frame: frame,
+                topURL: message.frameInfo.isMainFrame ? url : web?.url ?? url)
             guard body["epoch"] as? String == epoch else { throw CancellationError() }
             number = result["tabId"].number.map(Int.init); documents[key] = document
             return true
@@ -481,7 +485,8 @@ final class ChromiumDRMExtensions {
         // URL text from that world may update only within WKFrameInfo's native origin.
         if document.url != url {
             document = Document(id: document.id, nonce: nonce, frame: document.frame, info: message.frameInfo, url: url, epoch: epoch)
-            _ = try await session.request("ext.bridge.register", ["virtual": tab.id.uuidString, "document": document.id, "frame": document.frame, "url": registerURL(url).absoluteString, "topURL": message.frameInfo.isMainFrame ? registerURL(url).absoluteString : (web?.url?.absoluteString ?? url.absoluteString)])
+            _ = try await register(id, url, document: document, frame: document.frame,
+                topURL: message.frameInfo.isMainFrame ? url : web?.url ?? url)
             guard document.epoch == epoch else { throw CancellationError() }
             documents[key] = document
         }
@@ -607,5 +612,41 @@ final class ChromiumDRMExtensions {
         let target = documents.first { $0.key.hasPrefix(id + ":") && $0.value.frame == frame }?.value.info
         if frame != 0 && target == nil { return NSNull() }
         return try await javascript(body, arguments: [:], in: target, in: world(id))
+    }
+}
+
+/// What a scheme task's frame last asked to load. WebKit drops the fragment
+/// from the task's URL but keeps it in the navigation action, and a frame
+/// already showing an extension page must not become its own asker, so a
+/// record that no longer matches is an answer, not a miss. The map is bounded
+/// per tab; the oldest record goes first, never the whole map at once.
+struct ResourceNavigations {
+    enum Answer: Equatable { case source(URL), stale, none }
+    private var records: [UInt64: (url: URL, source: URL?)] = [:]
+    private var order: [UInt64] = []
+    static func fragmentless(_ url: URL) -> URL {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.fragment = nil
+        return components?.url ?? url
+    }
+    mutating func removeAll() { records.removeAll(); order.removeAll() }
+    mutating func record(frame: UInt64, url: URL, source: URL?) {
+        if records[frame] == nil { order.append(frame) }
+        records[frame] = (Self.fragmentless(url), source)
+        while records.count > 128, let oldest = order.first {
+            order.removeFirst()
+            records[oldest] = nil
+        }
+    }
+    mutating func clear(frame: UInt64, redirectingTo url: URL) -> Bool {
+        guard let pending = records.removeValue(forKey: frame) else { return false }
+        order.removeAll { $0 == frame }
+        return pending.source == nil && pending.url == Self.fragmentless(url)
+    }
+    mutating func take(frame: UInt64, url: URL) -> Answer {
+        guard let pending = records.removeValue(forKey: frame) else { return .none }
+        order.removeAll { $0 == frame }
+        guard let source = pending.source, pending.url == Self.fragmentless(url) else { return .stale }
+        return .source(source)
     }
 }

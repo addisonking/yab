@@ -1,6 +1,12 @@
 let lastNotification;
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if(message.kind==='sender'){reply(sender);return;}
+  if(message.kind==='resource-sender'){
+    chrome.tabs.sendMessage(sender.tab.id, {kind:'resource-reply'},
+      {frameId:sender.frameId,documentId:sender.documentId})
+      .then(reverse=>reply({sender,reverse}),error=>reply({error:String(error)}));
+    return true;
+  }
   if(message.kind==='notification'){lastNotification=message.nonce;return;}
   if(message.kind==='last-notification'){reply(lastNotification);return;}
   if(message.kind==='storage-access'){

@@ -41,10 +41,24 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
               let frame = Self.frame(task) else { return fail(task) }
         let path = String(url.path.dropFirst())
         let frameID = Self.frameID(frame)
-        let navigation = frameID.flatMap { bridge.takeResourceNavigation(frame: $0, url: url) }
-        let asker = navigation ?? Self.committedURL(frame)
+        // A navigation the delegate recorded answers for itself; a record
+        // that no longer matches fails closed rather than letting the frame's
+        // current extension page answer for a load it never asked for.
+        let navigation = frameID.map { bridge.takeResourceNavigation(frame: $0, url: url) } ?? .none
+        let asker: URL?
+        var navigated = false
+        switch navigation {
+        case .source(let source): asker = source; navigated = true
+        case .stale: return fail(task)
+        case .none:
+            asker = Self.committedURL(frame)
+            // A site may fetch its declared HTML resources, but a committed
+            // extension document cannot authorize an unrecorded HTML load.
+            if asker?.scheme == "chrome-extension", Self.mime(path).hasPrefix("text/html") { return fail(task) }
+        }
         let dynamic = id != owner
-        let sandboxAsset = navigation == nil && !dynamic && Self.sandboxAsset(path, owner: owner, frame: frame, manifest: manifest)
+        if navigated, path == Self.bootstrapPath { return fail(task) }
+        let sandboxAsset = !navigated && !dynamic && Self.sandboxAsset(path, owner: owner, frame: frame, manifest: manifest)
         guard sandboxAsset || (asker.map {
             $0 != url && Self.permits(path, dynamic: dynamic, owner: owner, asker: $0, manifest: manifest)
         } ?? false) else { return fail(task) }
@@ -67,7 +81,7 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
             guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return fail(task) }
             components.host = owner
             guard let canonical = components.url else { return fail(task) }
-            if navigation != nil, let frameID {
+            if navigated, let frameID {
                 bridge.recordResourceNavigation(frame: frameID, url: canonical, source: nil)
             }
             guard Self.redirect(task, from: url, to: canonical) else { return fail(task) }
@@ -119,6 +133,10 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         return owners.count == 1 ? owners.first : nil
     }
     static func permits(_ path: String, dynamic: Bool, owner: String, asker: URL, manifest: [String: Any]) -> Bool {
+        // A manifest wildcard cannot expose the generated bridge script.
+        if path == bootstrapPath {
+            return !dynamic && asker.scheme == "chrome-extension" && asker.host == owner && asker.port == nil
+        }
         if asker.scheme == "chrome-extension" {
             return asker.host == owner && asker.port == nil
                 && (!dynamic || ChromiumDRMExtensionScripts.dynamicResources(manifest).contains { pattern($0, covers: path) })
@@ -167,12 +185,17 @@ final class ChromiumDRMResources: NSObject, WKURLSchemeHandler {
         let frame = frameID(target)
         let redirected = frame.map { bridge.clearResourceNavigation(frame: $0, redirectingTo: url) } ?? false
         guard url.scheme == "chrome-extension", let host = url.host,
-              owner(for: host, entries: bridge.entries) != nil else { return true }
+              let owner = owner(for: host, entries: bridge.entries) else { return true }
         guard !target.isMainFrame else { return false }
         // The same scheme task sends the canonical redirect and the response.
         if redirected { return true }
         guard let frame, let sourceFrame = WindowGate.source(action),
-              let source = committedURL(sourceFrame) else { return false }
+              let source = committedURL(sourceFrame),
+              let manifest = bridge.entries[owner]?["manifest"] as? [String: Any],
+              url.path.count > 1 else { return false }
+        let path = String(url.path.dropFirst())
+        guard path != bootstrapPath, permits(path, dynamic: host != owner, owner: owner, asker: source, manifest: manifest)
+        else { return false }
         bridge.recordResourceNavigation(frame: frame, url: url, source: source)
         return true
     }

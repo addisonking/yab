@@ -99,6 +99,23 @@ def resource_probe(site, extension_id):
     return Promise.all([probe(allowed), probe(allowed.replace('127.0.0.1', 'localhost'))]);'''
 
 
+def resource_bridge_probe(extension_id):
+    origin = f'chrome-extension://{extension_id}'
+    return f'''const origin = {json.dumps(origin)};
+    const frame = document.createElement('iframe');
+    return new Promise(resolve => {{
+        const timer = setTimeout(() => finish(null), 12000);
+        const finish = value => {{ clearTimeout(timer); removeEventListener('message', receive); frame.remove(); resolve(value); }};
+        const receive = event => {{
+            if (event.source === frame.contentWindow && event.origin === origin && event.data?.resourceBridge)
+                finish(event.data.resourceBridge);
+        }};
+        addEventListener('message', receive);
+        frame.src = origin + '/resource.html#bridge';
+        document.body.append(frame);
+    }});'''
+
+
 def sandbox_probe(extension_id):
     return f'''const frame = document.createElement('iframe');
     frame.src = {json.dumps(f'chrome-extension://{extension_id}/sandbox.html')};
@@ -260,6 +277,14 @@ def run(app, out, site, cookies=True, extensions=True):
             allowed, excluded = script(tab, resource_probe(site, extension_id))
             checks['extension_resource_with_no_referrer'] = allowed is True
             checks['extension_resource_excluded_embedder'] = excluded is False
+            page_bridge = script(tab, resource_bridge_probe(extension_id))
+            report['states']['extension_page_bridge'] = page_bridge
+            page_sender = (page_bridge or {}).get('sender', {})
+            page_origin = f'chrome-extension://{extension_id}'
+            checks['extension_page_sender'] = (page_sender.get('url') == page_origin + '/resource.html#bridge'
+                                               and page_sender.get('origin') == page_origin
+                                               and page_sender.get('tab', {}).get('url') == site + '/eme')
+            checks['extension_page_reply'] = (page_bridge or {}).get('reverse') == 'extension-page-reply'
             sandbox = script(tab, sandbox_probe(extension_id))
             report['states']['extension_sandbox'] = sandbox
             checks['extension_sandbox_displays_own_assets'] = bool(sandbox and sandbox['image'] and sandbox['font'])

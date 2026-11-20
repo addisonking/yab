@@ -265,7 +265,14 @@ static bool ExtensionBridgeCommand(Tab& tab, NSString* method, NSDictionary* p, 
   }
   if([method isEqual:@"ext.bridge.register"]){
     NSString* identity=S(p,@"virtual"),*document=S(p,@"document"),*url=S(p,@"url");int frame=[p[@"frame"] intValue];
-    if(!identity.length||!document.length||![@[@"http",@"https"] containsObject:[NSURL URLWithString:url].scheme]){Reply(request,nil,@"Invalid virtual frame");return true;}
+    // An extension's own page frame registers under its real address, as
+    // Chrome reports sender.url; every other frame needs a web address it
+    // holds a grant for (checked on invoke).
+    NSURL* frameURL=[NSURL URLWithString:url];
+    NSString* extension=S(p,@"extension");
+    BOOL ownPage=frame>0&&[frameURL.scheme isEqual:@"chrome-extension"]&&[frameURL.host isEqual:extension]
+      &&!frameURL.port&&!frameURL.user&&!frameURL.password&&extensionCatalogs[@(profile.c_str())][extension];
+    if(!identity.length||!document.length||(!ownPage&&![@[@"http",@"https"] containsObject:frameURL.scheme])){Reply(request,nil,@"Invalid virtual frame");return true;}
     std::string key=profile+":"+Key(identity)+":"+std::to_string(frame);
     if(!extensionVirtuals.count(key)){
       // Frame numbers only grow within a tab's document set, so the lowest
@@ -319,8 +326,11 @@ static bool ExtensionBridgeCommand(Tab& tab, NSString* method, NSDictionary* p, 
   NSString* op=S(p,@"op");NSDictionary* sender=nil;
   if(![op isEqual:@"dnr.snapshot"]){
     std::string key=profile+":"+Key(S(p,@"virtual"))+":"+std::to_string([p[@"frame"] intValue]);auto v=extensionVirtuals.find(key);
-    if(v==extensionVirtuals.end()||v->second.control!=tab.id||v->second.document!=Key(S(p,@"document"))||!ExtensionAllowed(entry,v->second.url)){Reply(request,nil,@"Extension has no access to this virtual document");return true;}
-    NSURL* url=[NSURL URLWithString:v->second.url];NSString* origin=[NSString stringWithFormat:@"%@://%@%@",url.scheme,url.host,url.port?[@":" stringByAppendingString:url.port.stringValue]:@""];
+    if(v==extensionVirtuals.end()||v->second.control!=tab.id||v->second.document!=Key(S(p,@"document"))){Reply(request,nil,@"Extension has no access to this virtual document");return true;}
+    NSURL* url=[NSURL URLWithString:v->second.url];
+    BOOL ownPage=[url.scheme isEqual:@"chrome-extension"]&&[url.host isEqual:extension];
+    if(!ExtensionAllowed(entry,ownPage?v->second.topURL:v->second.url)){Reply(request,nil,@"Extension has no access to this virtual document");return true;}
+    NSString* origin=[NSString stringWithFormat:@"%@://%@%@",url.scheme,url.host,url.port?[@":" stringByAppendingString:url.port.stringValue]:@""];
     sender=@{@"id":extension,@"tab":@{@"id":@(v->second.number),@"url":v->second.topURL,@"incognito":@(profiles[profile].privateMode),@"active":@YES,@"windowId":@1},@"frameId":@(v->second.frame),@"documentId":@(v->second.document.c_str()),@"url":v->second.url,@"origin":origin};
   }
   if(![method isEqual:@"ext.bridge.invoke"]){Reply(request,nil,@"Unknown bridge method");return true;}

@@ -32,7 +32,12 @@ enum ChromiumDRMExtensionScripts {
       // Some extensions choose the browser namespace on WebKit's Safari user agent.
       globalThis.browser=globalThis.chrome={runtime,storage,i18n};
       const receive=async(op,args)=>{
-        if(relayIn){document.dispatchEvent(new CustomEvent('yab-page-incoming',{detail:JSON.stringify({op,args})}));return null}
+        if(relayIn)return new Promise((resolve,reject)=>{
+          const callId='in'+(++incomingSerial);
+          const timer=setTimeout(()=>{if(incoming.delete(callId))reject(Error('The extension page did not answer'))},12000);
+          incoming.set(callId,{resolve,reject,timer});
+          document.dispatchEvent(new CustomEvent('yab-page-incoming',{detail:JSON.stringify({callId,op,args})}));
+        });
         if(op==='tabs.sendMessage')return new Promise((resolve,reject)=>{
           const listeners=[...runtime.onMessage.listeners];
           if(!listeners.length){reject(Error('Receiving end does not exist'));return}
@@ -89,7 +94,13 @@ enum ChromiumDRMExtensionScripts {
       const ready=handler.postMessage({op:'hello',nonce,epoch:config.epoch,url:location.href});
       const call=(op,args)=>ready.then(()=>handler.postMessage({op,args:plain(args),nonce,epoch:config.epoch,url:location.href}));
       const relayIn=location.protocol==='chrome-extension:';
+      const incoming=new Map();let incomingSerial=0;
       if(relayIn){
+        document.addEventListener('yab-page-answer',event=>{
+          let answer;try{answer=JSON.parse(event.detail)}catch(error){return}
+          const entry=incoming.get(answer.callId);if(!entry)return;incoming.delete(answer.callId);
+          clearTimeout(entry.timer);answer.error?entry.reject(Error(answer.error)):entry.resolve(answer.value);
+        });
         document.addEventListener('yab-page-call',event=>{
           let request;try{request=JSON.parse(event.detail)}catch(error){return}
           call(request.op,request.args).then(
@@ -118,7 +129,9 @@ enum ChromiumDRMExtensionScripts {
       });
       document.addEventListener('yab-page-incoming',event=>{
         let request;try{request=JSON.parse(event.detail)}catch(error){return}
-        globalThis.__yabWK.receive(request.op,request.args);
+        Promise.resolve(globalThis.__yabWK.receive(request.op,request.args)).then(
+          value=>document.dispatchEvent(new CustomEvent('yab-page-answer',{detail:JSON.stringify({callId:request.callId,value})})),
+          error=>document.dispatchEvent(new CustomEvent('yab-page-answer',{detail:JSON.stringify({callId:request.callId,error:String(error&&error.message||error)})})));
       });
     """#
     static func bootstrap(_ config: [String: Any], page: Bool = false) throws -> String {

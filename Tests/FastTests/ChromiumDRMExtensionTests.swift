@@ -82,8 +82,68 @@ struct ChromiumDRMExtensionTests {
         #expect(context.evaluateScript("result.reply")?.toString() == "answer")
     }
 
-    /// The bootstrap's gate: the extension's own pages get the API world,
-    /// another extension's pages get nothing, and a web page needs a grant.
+    @Test func resourceNavigationRecordsMatchWithoutFragmentsAndBoundTheMap() {
+        var records = ResourceNavigations()
+        let page = URL(string: "http://example.test/login")!
+        let target = URL(string: "chrome-extension://id/popup.html")!
+        records.record(frame: 7, url: URL(string: "chrome-extension://id/popup.html#x")!, source: page)
+        #expect(records.take(frame: 7, url: target) == .source(page))
+        // A record that no longer matches fails closed instead of answering.
+        records.record(frame: 8, url: URL(string: "chrome-extension://id/a.html#y")!, source: page)
+        #expect(records.take(frame: 8, url: URL(string: "chrome-extension://id/b.html")!) == .stale)
+        #expect(records.take(frame: 9, url: target) == .none)
+        // The oldest record goes first, never the whole map at once.
+        for frame in 0..<129 {
+            records.record(frame: UInt64(100 + frame), url: URL(string: "chrome-extension://id/p\(frame).html")!, source: page)
+        }
+        #expect(records.take(frame: 100, url: URL(string: "chrome-extension://id/p0.html")!) == .none)
+        #expect(records.take(frame: 228, url: URL(string: "chrome-extension://id/p128.html")!) == .source(page))
+    }
+
+    /// The bridge's inbound messages reach the served page and its answer
+    /// reaches the sender, including a port's disconnection error.
+    @Test func inboundRelayAnswersReachTheSender() throws {
+        let id = "nngceckbapebfimnlniiiahkandclblb"
+        let context = try #require(JSContext())
+        context.evaluateScript("""
+            globalThis.CustomEvent = class { constructor(type, options) { this.type = type; this.detail = options && options.detail; } };
+            globalThis.document = { listeners: {},
+              addEventListener(name, fn) { (this.listeners[name] ??= []).push(fn); },
+              dispatchEvent(event) { for (const fn of this.listeners[event.type] || []) fn(event); return true; } };
+            globalThis.location = {href: 'chrome-extension://\(id)/overlay/menu.html', protocol: 'chrome-extension:'};
+            globalThis.crypto = {randomUUID: () => 'nonce', getRandomValues: bytes => bytes.fill(1)};
+            globalThis.setTimeout = () => 1;
+            globalThis.clearTimeout = () => {};
+            globalThis.webkit = {messageHandlers: {yabChromiumExtension: {postMessage: () => Promise.resolve()}}};
+            """)
+        context.evaluateScript(try ChromiumDRMExtensionScripts.bootstrap(["id": id, "epoch": "test"]))
+        let bootstrap = try ChromiumDRMExtensionScripts.bootstrap(["id": id, "epoch": "test"], page: true)
+        context.evaluateScript("""
+            globalThis.outcome = {};
+            globalThis.pageWorld = {};
+            ((globalThis) => { \(bootstrap) })(pageWorld);
+            pageWorld.browser.runtime.onMessage.addListener((message, _, reply) => reply({answered: message}));
+            __yabWK.receive('tabs.sendMessage', {message: 'tabs.sendMessage'}).then(value => outcome.answer = value, error => outcome.answerError = String(error));
+            __yabWK.receive('port.message', {port: 'gone'}).then(value => outcome.port = value, error => outcome.portError = String(error));
+            """)
+        context.evaluateScript("1")
+        #expect(context.exception == nil, Comment(rawValue: context.exception?.toString() ?? ""))
+        #expect(context.evaluateScript("outcome.answer && outcome.answer.answered === 'tabs.sendMessage'")?.toBool() == true)
+        #expect(context.evaluateScript("outcome.portError === 'Error: Port is disconnected'")?.toBool() == true)
+    }
+
+    @available(macOS 15.4, *)
+    @Test func generatedBootstrapIsPrivateEvenUnderAWildcard() {
+        let path = ChromiumDRMResources.bootstrapPath
+        let manifest = ["web_accessible_resources": [["resources": ["*"], "matches": ["<all_urls>"]]]]
+        let page = URL(string: "https://example.test/")!
+        let owner = URL(string: "chrome-extension://owner/menu.html")!
+        let other = URL(string: "chrome-extension://other/menu.html")!
+        #expect(!ChromiumDRMResources.permits(path, dynamic: false, owner: "owner", asker: page, manifest: manifest))
+        #expect(!ChromiumDRMResources.permits(path, dynamic: false, owner: "owner", asker: other, manifest: manifest))
+        #expect(ChromiumDRMResources.permits(path, dynamic: false, owner: "owner", asker: owner, manifest: manifest))
+    }
+
     @Test func pageGuardAdmitsOnlyTheExtensionsOwnPagesAndGrantedSites() throws {
         let id = "nngceckbapebfimnlniiiahkandclblb"
         let guardSource = try ChromiumDRMExtensionScripts.pageGuard(id: id, grants: ["http://127.0.0.1/*"])
