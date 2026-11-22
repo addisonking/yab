@@ -1936,10 +1936,16 @@ static void Input(Tab& tab, NSDictionary* p, NSString* request, bool nativePopup
           live->second.browser != browser || live->second.documentGeneration != generation) {
         Reply(request, nil, @"Page changed during pointer input"); return;
       }
-      CDP(live->second, @"Input.dispatchMouseEvent", @{@"type": types[kind], @"x": @(x / zoom / pinch), @"y": @(y / zoom / pinch),
+      NSMutableDictionary* event = [@{@"type": types[kind], @"x": @(x / zoom / pinch), @"y": @(y / zoom / pinch),
         @"button": moved ? @"none" : right ? @"right" : middle ? @"middle" : @"left",
         @"buttons": @(pressed || dragged ? (right ? 2 : middle ? 4 : 1) : 0),
-        @"clickCount": @(clicks), @"modifiers": @(modifiers)},
+        @"clickCount": @(clicks), @"modifiers": @(modifiers)} mutableCopy];
+      // Blink waits 150 ms after a press on selected text before it starts
+      // dragging it (kTextDragDelay, mouse_event_manager.cc); a quicker drag
+      // becomes a new selection and the text never drags. The press that
+      // follows a selection is that drag's start, so place it past the wait.
+      if ([kind isEqual:@"mouseDown"]) event[@"timestamp"] = @(NSDate.date.timeIntervalSince1970 - 0.2);
+      CDP(live->second, @"Input.dispatchMouseEvent", event,
         [request](NSDictionary* value, NSString* error) { Reply(request, value, error); });
     };
     WithPageZoom(tab, request, send);

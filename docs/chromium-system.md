@@ -13,7 +13,7 @@ Areas that move the real pointer or press keys (`drag`, `hover`, `keys`, `ime`,
 
 | What | How it crosses |
 | --- | --- |
-| Drags | `Input.setInterceptDrags` hands a drag the page starts to Yab (`page.dragStart`), which runs an AppKit session from the page's view. What is dragged over that view goes back in through `Input.dispatchDragEvent` (`input.drag`), files included. Trusted CDP input from an agent keeps DevTools' own drag controller (`DragScriptInput`). |
+| Drags | `Input.setInterceptDrags` hands a drag the page starts to Yab (`page.dragStart`), which runs an AppKit session from the page's view. What is dragged over that view goes back in through `Input.dispatchDragEvent` (`input.drag`), files included. Trusted CDP input from an agent keeps DevTools' own drag controller (`DragScriptInput`). A left press is dated 200 ms back, past Blink's 150 ms `kTextDragDelay` on macOS, so dragging a selection starts at once instead of reselecting. |
 | Cursor | `OnCursorChange` sends Chromium's own NSCursor as a picture, once per kind (`page.cursor`). Yab sets it only while the pointer is over the page. |
 | Tooltips | CEF calls `OnTooltip` only for offscreen views, so `chromium-tips.js` reads the nearest `title` over the pointer. Drawn as every tip in Yab is (`KeyTip`). |
 | Links for other apps | `OnBeforeBrowse` stops every scheme a page can't show (`page.external`); `Browser`'s action policy decides, as on a WebKit tab. Chrome's own question would wait in a hidden window. |
