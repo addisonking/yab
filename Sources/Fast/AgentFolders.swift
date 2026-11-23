@@ -250,7 +250,7 @@ extension Agents {
     /// opened, the one in front of you too. Done is finished with them;
     /// ⌥ is the way to keep them.
     func leftovers(_ id: String) -> [Tab] {
-        guard let browser else { return [] }
+        guard let browser = window(of: id) ?? browser else { return [] }
         return leftovers(id, among: browser.tabs)
     }
 
