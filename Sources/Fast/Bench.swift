@@ -9711,11 +9711,14 @@ final class Bench {
     /// The window a call runs in when the call doesn't pick one.
     /// A task's calls work in the window its task began in (#1009):
     /// the tabs it opens, the person's tabs it reads, its questions.
-    /// One that began nowhere in particular (a routine's run, a task
-    /// from the iPhone, an agent that attached itself) keeps the bound
-    /// browser, as does one whose window has closed.
+    /// A private window keeps agents out of private tabs (benchOpen
+    /// forces every tab there to be shy, which agent calls hide and
+    /// refuse), so a task started in one falls back to the bound normal
+    /// browser. One that began nowhere in particular (a routine's run,
+    /// a task from the iPhone, an agent that attached itself) keeps the
+    /// bound browser, as does one whose window has closed.
     private func target(_ request: [String: Any]) -> Browser? {
-        let preferred = (request["session"] as? String).flatMap { Agents.shared.window(of: $0) } ?? browser
+        let preferred = (request["session"] as? String).flatMap { Agents.shared.browsingWindow(of: $0) } ?? browser
         return preferred.map { holder(of: request, in: BrowserWindows.shared.live($0)) }
     }
 

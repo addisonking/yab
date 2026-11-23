@@ -146,4 +146,32 @@ struct TaskOriginWindowTests {
         #expect(w.second.toaster.shown)
         #expect(!w.first.toaster.shown)
     }
+
+    @Test func aPrivateWindowTaskKeepsNoticesThereButBrowsesInANormalWindow() throws {
+        let w = World(); defer { w.dispose() }
+        let shy = Browser(windowID: UUID(), purpose: .privateOnly)
+        let shyWindow = NSWindow(contentRect: CGRect(x: -8000, y: -8000, width: 900, height: 650),
+                                 styleMask: .borderless, backing: .buffered, defer: false)
+        shyWindow.isReleasedWhenClosed = false
+        BrowserWindows.shared.register(shyWindow, for: shy)
+        defer {
+            shyWindow.close()
+            for tab in shy.tabs + shy.parkedTabs { tab.close() }
+            shy.dozing?.invalidate()
+            shy.stuck.timer?.invalidate()
+            shy.pressure?.cancel()
+            shy.letGo()
+            BrowserWindows.shared.forgetForTests(shy)
+        }
+        let id = "origin-private-" + UUID().uuidString
+        Agents.shared.benchTask(id, state: .running)
+        let session = try #require(Agents.shared.session(id))
+        session.nativeWindowID = shy.windowID
+        #expect(Agents.shared.window(of: id) === shy)
+        #expect(Agents.shared.browsingWindow(of: id) == nil)
+        // Its done toast still lands in the private window where the user started it.
+        Agents.shared.taskEnded(session, .done)
+        #expect(shy.toaster.shown)
+        #expect(!w.first.toaster.shown)
+    }
 }

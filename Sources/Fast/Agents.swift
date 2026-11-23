@@ -652,6 +652,15 @@ final class Agents: ObservableObject {
         return BrowserWindows.shared.browsers.first { ($0.windowID ?? BrowserWindows.primaryID) == held }
     }
 
+    /// The window a session's browsing tabs belong to: its originating
+    /// window when that is a normal window, or nil for a private window
+    /// (where benchOpen forces every tab to be shy, which agent calls hide
+    /// and refuse), an originless session, or a closed window.
+    func browsingWindow(of id: String?) -> Browser? {
+        guard let origin = window(of: id), origin.windowPurpose != .privateOnly else { return nil }
+        return origin
+    }
+
     // MARK: - chats
 
     /// The session whose chat this one's steps belong to: itself, or the
@@ -690,7 +699,7 @@ final class Agents: ObservableObject {
         let everyone = Set([session.id] + subs.map(\.id))
         // A sealed run's tabs are in a folder nobody goes into: its chat
         // doesn't lead there either.
-        let tabs = session.sealed ? [] : ((window(of: session.id) ?? browser)?.tabs ?? []).filter { $0.agent.map(everyone.contains) ?? false }
+        let tabs = session.sealed ? [] : ((browsingWindow(of: session.id) ?? browser)?.tabs ?? []).filter { $0.agent.map(everyone.contains) ?? false }
         let first = session.items.first { $0.kind == .asked }?.text ?? session.asked.first ?? session.prompt
         let old = Chats.shared.chat(session.id)
         return Chat(id: session.id, title: session.title ?? old?.title ?? Chat.title(from: first), began: session.origin, cli: session.cli,
