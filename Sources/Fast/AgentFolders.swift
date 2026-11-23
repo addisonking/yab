@@ -261,13 +261,21 @@ extension Agents {
         return tabs.filter { $0.agent != nil && self.root(of: $0.agent) == root }
     }
 
+    /// The browser holding `id`'s work tabs when acting from `browser`:
+    /// its browsing window, or the bound normal browser when the chat lives
+    /// in a private window (where agent tabs open in a normal window).
+    func tabBrowser(of id: String, from browser: Browser) -> Browser {
+        browsingWindow(of: id) ?? (browser.windowPurpose == .privateOnly ? self.browser : nil) ?? browser
+    }
+
     /// Done, pressed in a finished task's chat: the column goes, and the
     /// task's tabs with it unless ⌥ keeps them. Kept, a tab you were
     /// driving is handed back: there is nobody left to hand it to.
     func finish(_ id: String, in browser: Browser, keepingTabs: Bool) {
-        let tabs = leftovers(id, among: browser.tabs)
+        let host = tabBrowser(of: id, from: browser)
+        let tabs = leftovers(id, among: host.tabs)
         for tab in tabs { AgentFeed.shared.handBack(tab) }
-        if !keepingTabs { browser.close(tabs) }
+        if !keepingTabs { host.close(tabs) }
         browser.moveChat(open: false)
     }
 

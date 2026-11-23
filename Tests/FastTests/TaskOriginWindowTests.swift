@@ -173,5 +173,12 @@ struct TaskOriginWindowTests {
         Agents.shared.taskEnded(session, .done)
         #expect(shy.toaster.shown)
         #expect(!w.first.toaster.shown)
+        // Pressing Done from the private window closes the task's tabs in the normal window.
+        let work = Tab(bench: true)
+        work.agent = id
+        w.first.lay([work])
+        #expect(Agents.shared.tabBrowser(of: id, from: shy) === w.first)
+        Agents.shared.finish(id, in: shy, keepingTabs: false)
+        #expect(w.first.tabs.isEmpty)
     }
 }

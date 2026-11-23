@@ -2502,7 +2502,7 @@ private struct ChatDone: View {
     @ObservedObject private var keepDone = Keymap.shared.slot(.chatDoneKeep)
 
     var body: some View {
-        let left = Agents.shared.leftovers(chat, among: browser.tabs).count
+        let left = Agents.shared.leftovers(chat, among: Agents.shared.tabBrowser(of: chat, from: browser).tabs).count
         let keep = option.down && left > 0
         Button { Agents.shared.finish(chat, in: browser, keepingTabs: keep) } label: {
             HStack(spacing: 6) {
