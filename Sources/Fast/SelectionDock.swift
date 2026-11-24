@@ -30,9 +30,10 @@ struct SelectionDockContent: View {
         VStack(alignment: .leading, spacing: 0) {
             if Self.expanded(commands) {
                 ThreadScrollView {
-                    Text(commands.stage == .failed ? commands.error : commands.output)
+                    Text(commands.stage == .failed ? AttributedString(commands.error) : AgentAnswer.rich(commands.output))
                         .font(.system(size: 13.5))
                         .foregroundStyle(commands.stage == .failed ? ButtonCSS.danger : Palette.ink)
+                        .lineSpacing(2)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
