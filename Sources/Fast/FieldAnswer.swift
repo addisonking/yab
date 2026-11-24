@@ -34,8 +34,8 @@ struct FieldAnswer: View {
                     VStack(alignment: .leading, spacing: 12) {
                         said
                         ForEach(commands.turns) { turn in
-                            // Its Markdown read, as the answer showing reads it.
-                            Text(AgentAnswer.rich(turn.answer))
+                            // Its Markdown read, as the answer showing reads it (rewrites stay literal).
+                            Text(browser.answerIsRewrite ? AttributedString(turn.answer) : AgentAnswer.rich(turn.answer))
                                 .font(.system(size: 13))
                                 .foregroundStyle(Palette.muted)
                                 .lineLimit(3)

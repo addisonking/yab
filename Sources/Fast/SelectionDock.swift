@@ -26,11 +26,19 @@ struct SelectionDockContent: View {
 
     private var width: CGFloat { max(160, min(456, (tab.builtPage?.bounds.width ?? 480) - 24)) }
 
+    static func displayText(_ commands: SelectionCommands) -> AttributedString {
+        if commands.stage == .failed { return AttributedString(commands.error) }
+        if SelectionCommands.rewrites(commands.command, editable: commands.snapshot?.editable == true) {
+            return AttributedString(commands.output)
+        }
+        return AgentAnswer.rich(commands.output)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if Self.expanded(commands) {
                 ThreadScrollView {
-                    Text(commands.stage == .failed ? AttributedString(commands.error) : AgentAnswer.rich(commands.output))
+                    Text(Self.displayText(commands))
                         .font(.system(size: 13.5))
                         .foregroundStyle(commands.stage == .failed ? ButtonCSS.danger : Palette.ink)
                         .lineSpacing(2)

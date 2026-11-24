@@ -101,4 +101,21 @@ struct FieldAnswerTests {
         #expect(boldRuns.contains("$ANT:"))
         #expect(boldRuns.contains("put option"))
     }
+
+    @Test @MainActor func selectionDockKeepsRewritePreviewsLiteralAndFormatsAnswers() throws {
+        let commands = SelectionCommands()
+        let markdown = "# Release notes\n- Ship **Friday**"
+        commands.output = markdown
+        commands.stage = .preview
+        commands.command = try #require(SelectionCommand.builtIn.first { $0.id == "improve" })
+        #expect(String(SelectionDockContent.displayText(commands).characters) == markdown)
+
+        commands.command = try #require(SelectionCommand.builtIn.first { $0.id == "explain" })
+        let rendered = String(SelectionDockContent.displayText(commands).characters)
+        #expect(rendered == "Release notes\n• Ship Friday")
+
+        commands.stage = .failed
+        commands.error = "**raw error**"
+        #expect(String(SelectionDockContent.displayText(commands).characters) == "**raw error**")
+    }
 }

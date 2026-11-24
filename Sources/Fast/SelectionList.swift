@@ -170,7 +170,7 @@ struct SelectionLayer: View {
             Shimmer(text: "Working on the selection…", size: 13.5)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            Text(commands.stage == .failed ? AttributedString(commands.error) : AgentAnswer.rich(commands.output))
+            Text(SelectionDockContent.displayText(commands))
                 .font(.system(size: 13.5))
                 .foregroundStyle(commands.stage == .failed ? ButtonCSS.danger : Palette.ink)
                 .lineSpacing(2)
