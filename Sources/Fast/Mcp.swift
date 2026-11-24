@@ -159,9 +159,8 @@ enum Wire {
     /// is started by its test), only with agents let in, and only as long
     /// as it takes a browser to launch. Whether it is listening now.
     private static func wake(_ path: String) -> Bool {
-        guard !woken, allowed, !Store.testing, path == socket([]),
+        guard allowed, !Store.testing, path == socket([]),
               Bundle.main.bundlePath.hasSuffix(".app") else { return false }
-        woken = true
         // Open but not listening: starting up, or a hidden yab on its way
         // out (it closes the socket first). Its socket, or its end.
         if running {
@@ -173,6 +172,8 @@ enum Wire {
             }
             if running { return false }
         }
+        guard !woken else { return false }
+        woken = true
         return launch(path, ["--headless"])
     }
 
@@ -227,6 +228,9 @@ enum Mcp {
     /// The agent session this server speaks for: given by the browser when
     /// it started the agent, or handed out when a client connects on its own.
     static var session: String?
+    /// The session id `attach()` obtained, so a long-lived outside server only
+    /// re-acquires a handle it created itself after Yab restarts.
+    private static var attachedSession: String?
     static var inner = false
     /// `--assistant ID`: an assistant in the cloud's server (McpToolsAssistant),
     /// started by the browser for the calls the host's socket brings.
@@ -260,13 +264,19 @@ enum Mcp {
     /// What the user let agents have beyond the browser, as the browser
     /// says it (`agent-caps`): read when the tools are listed, and again
     /// now and then, since Settings can change while a session runs.
-    private static var caps: [String: Any] {
+    static var caps: [String: Any] {
         if let known = capsKnown { return known }
         var asked: [String: Any] = ["do": "agent-caps"]
         if let session { asked["session"] = session }
-        let got = wire(asked)
-        capsKnown = got
-        capsAt = Date()
+        var got = wire(asked)
+        if shouldReattach(got), reattach() {
+            if let session { asked["session"] = session }
+            got = wire(asked)
+        }
+        if got["error"] == nil {
+            capsKnown = got
+            capsAt = Date()
+        }
         return got
     }
     private static var capsKnown: [String: Any]?
@@ -299,6 +309,7 @@ enum Mcp {
     private static func recheck() {
         guard let listed, Date().timeIntervalSince(capsAt) > 60 else { return }
         capsKnown = nil
+        guard caps["error"] == nil else { return }
         let names = tools.compactMap { $0["name"] as? String }
         guard names != listed else { return }
         say(["jsonrpc": "2.0", "method": "notifications/tools/list_changed"])
@@ -310,6 +321,7 @@ enum Mcp {
         signal(SIGPIPE, SIG_IGN)
         socket = Wire.socket(args)
         session = Wire.value(args, "--session")
+        attachedSession = nil
         inner = args.contains("--inner")
         assistant = Wire.value(args, "--assistant")
         phoneReadOnly = inner && args.contains("--phone-read-only")
@@ -536,15 +548,16 @@ enum Mcp {
 
     private static var audience: Audience {
         var a = mode
-        a.knowing = knowing
-        a.keepsFolder = keepsFolder
-        a.mailbox = mailbox
-        a.mailAgents = mailAgents
-        a.recall = recall
-        a.mailCodes = mailCodes
-        a.messages = messages
-        a.boost = caps["boost"] as? Bool == true
-        if let mine = caps["assistant"] as? [String: Any] {
+        let got = caps
+        a.knowing = got["knowing"] as? Bool ?? false
+        a.keepsFolder = got["folder"] as? Bool ?? false
+        a.mailbox = got["mailbox"] as? Bool ?? false
+        a.mailAgents = got["mailAgents"] as? Bool ?? false
+        a.recall = got["recall"] as? Bool ?? false
+        a.mailCodes = got["mail"] as? Bool ?? false
+        a.messages = got["messages"] as? Bool ?? false
+        a.boost = got["boost"] as? Bool == true
+        if let mine = got["assistant"] as? [String: Any] {
             a.assistant = true
             a.assistantTasks = mine["tasks"] as? Bool == true
             a.assistantMail = mine["mail"] as? Bool == true
@@ -695,7 +708,12 @@ enum Mcp {
         guard !cancelled else { return ["error": "The user stopped this call. Stop now."] }
         var request = request
         if let session { request["session"] = session }
-        return wire(request)
+        let got = wire(request)
+        if shouldReattach(got), reattach() {
+            if let session { request["session"] = session }
+            return wire(request)
+        }
+        return got
     }
 
     /// The agent session this connection belongs to, as the client says it
@@ -709,13 +727,52 @@ enum Mcp {
     /// This server's session, made on first use by a client that came on its
     /// own, so a client that only lists tools never shows up in the window.
     private static func attach() {
-        guard session == nil, !inner else { return }
+        guard session == nil, outside else { return }
         var request: [String: Any] = ["do": "agent-attach", "name": client]
         // The client's own session, so a yes to reading mail covers every
         // connection it opens (Agents.mailGrants).
         if let own = clientSession { request["client"] = own }
         let got = wire(request)
-        session = got["session"] as? String
+        if let id = got["session"] as? String {
+            session = id
+            attachedSession = id
+            capsKnown = nil
+            capsAt = .distantPast
+        }
+    }
+
+    private static func shouldReattach(_ got: [String: Any]) -> Bool {
+        guard outside, let session, attachedSession == session else { return false }
+        return got["error"] as? String == ContextConsent.unavailable
+    }
+
+    /// Drop a stale self-attached session (e.g. after Yab restarted) and
+    /// acquire a fresh one so the caller can retry once. Keeps the old id
+    /// if reattaching fails so later calls in the same tool don't go out
+    /// sessionless and can still retry reattach once Yab is back.
+    private static func reattach() -> Bool {
+        guard outside, let current = session, attachedSession == current else { return false }
+        session = nil
+        attachedSession = nil
+        attach()
+        guard session != nil else {
+            session = current
+            attachedSession = current
+            return false
+        }
+        named = false
+        return true
+    }
+
+    static func resetSessionStateForTesting() {
+        session = nil
+        attachedSession = nil
+        inner = false
+        assistant = nil
+        named = false
+        capsKnown = nil
+        capsAt = .distantPast
+        keepSession = false
     }
 
     /// Why an iPhone task's server won't make this call, asked before the
@@ -767,6 +824,11 @@ enum Mcp {
         client = "yab"
         defer {
             if let session { _ = wire(["do": "agent-detach", "session": session].merging(keepSession ? ["after": keptFor] : [:]) { $1 }) }
+            if attachedSession == session {
+                session = nil
+                attachedSession = nil
+            }
+            keepSession = false
         }
         return body()
     }
@@ -820,6 +882,7 @@ enum Mcp {
             while Date() < limit, !cancelled {
                 wait["seconds"] = told ? min(20, max(1, limit.timeIntervalSinceNow)) : 0.3
                 let heard = ask(wait)
+                if let error = heard["error"] as? String { return ["error": error] }
                 state = heard["state"] as? String ?? "done"
                 mailResult = heard["result"] as? [String: Any]
                 if let asked = heard["question"] as? String, !asked.isEmpty { question = asked }
