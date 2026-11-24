@@ -239,4 +239,32 @@ struct ChatEmptyWindowTests {
         #expect(rect.width < ChatLook.most, "the drawn column must not overflow a narrow empty window")
         #expect(rect.minX >= 0 && rect.maxX <= fixture.host.bounds.width + 1)
     }
+
+    @Test(arguments: [false, true])
+    func emptyWindowFieldRoomClearsChatWhenBothFitAndStaysInWindowWhenNarrower(chatLeads: Bool) {
+        let margins = EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8)
+        let chatRoom: CGFloat = 336
+
+        // 960pt: empty card is narrower than the box, but the window can
+        // hold both the box and the chat column without overlap.
+        let (lead960, trail960) = ContentView.emptyWindowFieldRoom(
+            in: 960, side: chatLeads ? 0 : 220, far: chatLeads ? 220 : 0,
+            margins: margins, chatRoom: chatRoom, chatLeads: chatLeads
+        )
+        if chatLeads {
+            #expect(lead960 >= margins.leading + chatRoom, "box clears leading chat column")
+        } else {
+            #expect(trail960 >= margins.trailing + chatRoom, "box clears trailing chat column")
+        }
+        #expect(lead960 >= 0 && trail960 >= 0)
+        #expect(960 - lead960 - trail960 >= Omnibox.compactWidth + 2 * Omnibox.margin)
+
+        // 780pt: narrower than chat + compact box; stays inside [0, 780].
+        let (lead780, trail780) = ContentView.emptyWindowFieldRoom(
+            in: 780, side: chatLeads ? 0 : 220, far: chatLeads ? 220 : 0,
+            margins: margins, chatRoom: chatRoom, chatLeads: chatLeads
+        )
+        #expect(lead780 >= 0 && trail780 >= 0)
+        #expect(lead780 + trail780 <= 780 - Omnibox.compactWidth - 2 * Omnibox.margin + 0.5)
+    }
 }

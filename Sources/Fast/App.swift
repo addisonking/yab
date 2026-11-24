@@ -1645,21 +1645,31 @@ struct ContentView: View {
             let room = ChatRoom.room(DevRoom.Rim(card: laid), width: chatShown)
             let side = browser.flank == .left ? browser.sideShown : 0
             let far = browser.flank == .left ? 0 : browser.sideShown
-            let lead = side + margins.leading + (browser.chatLeads ? room : 0)
-            let trail = far + margins.trailing + (browser.chatLeads ? 0 : room)
-            let need = Omnibox.compactWidth + 2 * Omnibox.margin
-            guard width - lead - trail < need else { return (lead, trail) }
-            if browser.chatLeads {
-                let keptLead = max(0, min(lead, width - need))
-                return (keptLead, max(0, width - keptLead - need))
-            }
-            let keptTrail = max(0, min(trail, width - need))
-            return (max(0, width - keptTrail - need), keptTrail)
+            return Self.emptyWindowFieldRoom(in: width, side: side, far: far, margins: margins,
+                                             chatRoom: room, chatLeads: browser.chatLeads)
         }
         let need = Metrics.fieldWidth + 32
         guard half.width < need else { return (half.minX, max(0, width - half.maxX)) }
         let lead = min(max(half.midX - need / 2, 0), max(0, width - need))
         return (lead, max(0, width - lead - need))
+    }
+
+    /// Empty-window field insets beside an open chat column: center in the
+    /// remaining empty card when it holds the compact box width, keep the
+    /// chat column clear while the rest of the window still fits it, and
+    /// keep the box inside the window when the window is narrower than both.
+    static func emptyWindowFieldRoom(in width: CGFloat, side: CGFloat, far: CGFloat,
+                                     margins: EdgeInsets, chatRoom: CGFloat, chatLeads: Bool) -> (CGFloat, CGFloat) {
+        let lead = side + margins.leading + (chatLeads ? chatRoom : 0)
+        let trail = far + margins.trailing + (chatLeads ? 0 : chatRoom)
+        let need = Omnibox.compactWidth + 2 * Omnibox.margin
+        guard width - lead - trail < need else { return (lead, trail) }
+        if chatLeads {
+            let keptLead = max(0, min(lead, width - need))
+            return (keptLead, max(0, width - keptLead - need))
+        }
+        let keptTrail = max(0, min(trail, width - need))
+        return (max(0, width - keptTrail - need), keptTrail)
     }
 
     /// The panels. All the same kind of thing, so they are built the same way.
