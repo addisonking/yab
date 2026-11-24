@@ -187,13 +187,24 @@ struct McpToolsTests {
         private var nextID = 0
         private var liveSessions: Set<String> = []
         private var _attachCount = 0
+        private var _attachMailFlags: [Bool] = []
         private var _failAttach = false
         private var _overrideError: String?
         private var _askOnce = false
+        private var _restartOnAsk = false
+        private var _openCalls = 0
 
         var attachCount: Int {
             lock.lock(); defer { lock.unlock() }
             return _attachCount
+        }
+        var attachMailFlags: [Bool] {
+            lock.lock(); defer { lock.unlock() }
+            return _attachMailFlags
+        }
+        var openCalls: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _openCalls
         }
         var failAttach: Bool {
             get { lock.lock(); defer { lock.unlock() }; return _failAttach }
@@ -206,6 +217,10 @@ struct McpToolsTests {
         var askOnce: Bool {
             get { lock.lock(); defer { lock.unlock() }; return _askOnce }
             set { lock.lock(); _askOnce = newValue; lock.unlock() }
+        }
+        var restartOnAsk: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _restartOnAsk }
+            set { lock.lock(); _restartOnAsk = newValue; lock.unlock() }
         }
 
         init() throws {
@@ -268,6 +283,7 @@ struct McpToolsTests {
             let verb = req["do"] as? String ?? ""
             if verb == "agent-attach" {
                 _attachCount += 1
+                _attachMailFlags.append(req["mail"] as? Bool == true)
                 if _failAttach { return ["error": "Yab isn't running."] }
                 nextID += 1
                 let id = "s\(nextID)"
@@ -290,6 +306,14 @@ struct McpToolsTests {
                 return ["ok": true]
             case "agent-caps":
                 return ["messages": true]
+            case "open":
+                _openCalls += 1
+                if _restartOnAsk {
+                    _restartOnAsk = false
+                    liveSessions.removeAll()
+                    return ["error": "this waits for the person's yes; asking them now", "asking": true, "chat": req["session"] as? String ?? ""]
+                }
+                return ["id": "t1", "title": "Example", "url": req["url"] as? String ?? ""]
             case "click":
                 if _askOnce {
                     _askOnce = false
@@ -297,7 +321,14 @@ struct McpToolsTests {
                 }
                 return ["done": "mouse"]
             case "handoff-wait":
+                // Mimics Bench.handleHandoffWait: if a replacement session polled for
+                // a missing chat after restart, Yab returns state: "done".
+                if let chat = req["chat"] as? String, !liveSessions.contains(chat) {
+                    return ["state": "done"]
+                }
                 return ["error": "no pending question"]
+            case "agent-mail-triage":
+                return ["text": "Inbox clear."]
             default:
                 return ["ok": true]
             }
@@ -454,6 +485,49 @@ struct McpToolsTests {
             let got = Mcp.patient(["do": "click", "id": "t1", "ref": "e1"])
             #expect(got["error"] as? String == "no pending question")
             #expect(got["allowed"] == nil)
+        }
+    }
+
+    @Test func restartDuringApprovalWaitDoesNotReattachOrBypassPrompt() throws {
+        let mock = try MockBrowser()
+        defer { mock.stop() }
+        withCleanMcp(mock.path) {
+            #expect(Mcp.call("tabs", [:])["isError"] as? Bool == false)
+            #expect(Mcp.session == "s1")
+            #expect(mock.attachCount == 1)
+
+            // `open` asks for permission, then Yab restarts before `handoff-wait` polls.
+            // `handoff-wait` must not reattach (which would hit Yab's missing-chat `state: "done"` branch).
+            mock.restartOnAsk = true
+            let got = Mcp.patient(["do": "open", "url": "https://unfamiliar.example/"])
+            #expect(got["error"] as? String == ContextConsent.unavailable)
+            #expect(got["allowed"] == nil)
+            #expect(mock.openCalls == 1)
+            #expect(mock.attachCount == 1)
+            #expect(Mcp.session == "s1")
+
+            // A fresh call after the aborted wait still recovers cleanly.
+            let next = Mcp.call("tabs", [:])
+            #expect(next["isError"] as? Bool == false)
+            #expect(Mcp.session == "s2")
+            #expect(mock.attachCount == 2)
+        }
+    }
+
+    @Test func reattachPreservesMailTaintAcrossRestart() throws {
+        let mock = try MockBrowser()
+        defer { mock.stop() }
+        withCleanMcp(mock.path) {
+            #expect(Mcp.call("tabs", [:])["isError"] as? Bool == false)
+            #expect(mock.attachMailFlags == [false])
+
+            let mail = Mcp.ask(["do": "agent-mail-triage"])
+            #expect(mail["error"] == nil)
+
+            mock.restart()
+            #expect(Mcp.call("tabs", [:])["isError"] as? Bool == false)
+            #expect(Mcp.session == "s2")
+            #expect(mock.attachMailFlags == [false, true])
         }
     }
 
