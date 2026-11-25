@@ -661,6 +661,14 @@ final class Agents: ObservableObject {
         return origin
     }
 
+    /// The live normal window a session's browsing tabs belong to, applying
+    /// BrowserWindows.live so a closed launch-bound window resolves to the
+    /// live normal window Bench opens its tabs in (#1119).
+    func liveBrowsingWindow(of id: String?) -> Browser? {
+        if let origin = browsingWindow(of: id) { return BrowserWindows.shared.live(origin) }
+        return browser.map { BrowserWindows.shared.live($0) }
+    }
+
     // MARK: - chats
 
     /// The session whose chat this one's steps belong to: itself, or the
@@ -699,7 +707,7 @@ final class Agents: ObservableObject {
         let everyone = Set([session.id] + subs.map(\.id))
         // A sealed run's tabs are in a folder nobody goes into: its chat
         // doesn't lead there either.
-        let tabs = session.sealed ? [] : ((browsingWindow(of: session.id) ?? browser)?.tabs ?? []).filter { $0.agent.map(everyone.contains) ?? false }
+        let tabs = session.sealed ? [] : (liveBrowsingWindow(of: session.id)?.tabs ?? []).filter { $0.agent.map(everyone.contains) ?? false }
         let first = session.items.first { $0.kind == .asked }?.text ?? session.asked.first ?? session.prompt
         let old = Chats.shared.chat(session.id)
         return Chat(id: session.id, title: session.title ?? old?.title ?? Chat.title(from: first), began: session.origin, cli: session.cli,

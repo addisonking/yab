@@ -181,4 +181,50 @@ struct TaskOriginWindowTests {
         Agents.shared.finish(id, in: shy, keepingTabs: false)
         #expect(w.first.tabs.isEmpty)
     }
+
+    @Test func aPrivateWindowTaskDoneFollowsLiveNormalWindowWhenFirstCloses() throws {
+        let w = World(); defer { w.dispose() }
+        let shy = Browser(windowID: UUID(), purpose: .privateOnly)
+        let shyWindow = NSWindow(contentRect: CGRect(x: -8000, y: -8000, width: 900, height: 650),
+                                 styleMask: .borderless, backing: .buffered, defer: false)
+        shyWindow.isReleasedWhenClosed = false
+        BrowserWindows.shared.register(shyWindow, for: shy)
+        defer {
+            shyWindow.close()
+            for tab in shy.tabs + shy.parkedTabs { tab.close() }
+            shy.dozing?.invalidate()
+            shy.stuck.timer?.invalidate()
+            shy.pressure?.cancel()
+            shy.letGo()
+            BrowserWindows.shared.forgetForTests(shy)
+        }
+        // Keep the second normal window visible and close the launch-bound first window (#1119).
+        w.windows[1].orderFront(nil)
+        w.windows[0].close()
+
+        let id = "origin-private-closed-first-" + UUID().uuidString
+        Agents.shared.benchTask(id, state: .running)
+        let session = try #require(Agents.shared.session(id))
+        session.nativeWindowID = shy.windowID
+
+        let work = Tab(bench: true)
+        work.agent = id
+        w.second.lay([work])
+
+        let host = Agents.shared.tabBrowser(of: id, from: shy)
+        #expect(host === w.second)
+        #expect(Agents.shared.leftovers(id, among: host.tabs).map(\.id) == [work.id])
+
+        // Option + Done closes the private chat while keeping the work tab in the second normal window.
+        shy.moveChat(open: true)
+        Agents.shared.finish(id, in: shy, keepingTabs: true)
+        #expect(!shy.chatOpen)
+        #expect(w.second.tabs.map(\.id) == [work.id])
+
+        // Plain Done closes both the private chat and the work tab in the second normal window.
+        shy.moveChat(open: true)
+        Agents.shared.finish(id, in: shy, keepingTabs: false)
+        #expect(!shy.chatOpen)
+        #expect(w.second.tabs.isEmpty)
+    }
 }

@@ -250,7 +250,7 @@ extension Agents {
     /// opened, the one in front of you too. Done is finished with them;
     /// ⌥ is the way to keep them.
     func leftovers(_ id: String) -> [Tab] {
-        guard let browser = browsingWindow(of: id) ?? browser else { return [] }
+        guard let browser = liveBrowsingWindow(of: id) else { return [] }
         return leftovers(id, among: browser.tabs)
     }
 
@@ -262,10 +262,17 @@ extension Agents {
     }
 
     /// The browser holding `id`'s work tabs when acting from `browser`:
-    /// its browsing window, or the bound normal browser when the chat lives
-    /// in a private window (where agent tabs open in a normal window).
+    /// its live browsing window, any open normal window holding its tabs,
+    /// or the live normal fallback when the chat lives in a private window.
     func tabBrowser(of id: String, from browser: Browser) -> Browser {
-        browsingWindow(of: id) ?? (browser.windowPurpose == .privateOnly ? self.browser : nil) ?? browser
+        if let origin = browsingWindow(of: id) { return BrowserWindows.shared.live(origin) }
+        if let holder = BrowserWindows.shared.browsers.first(where: { $0.windowPurpose != .privateOnly && !leftovers(id, among: $0.tabs).isEmpty }) {
+            return holder
+        }
+        if browser.windowPurpose == .privateOnly, let fallback = self.browser.map({ BrowserWindows.shared.live($0) }) {
+            return fallback
+        }
+        return browser
     }
 
     /// Done, pressed in a finished task's chat: the column goes, and the
