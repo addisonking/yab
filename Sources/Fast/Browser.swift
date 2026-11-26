@@ -6346,7 +6346,7 @@ final class Browser: NSObject, ObservableObject, Relaying {
                 return
             }
             if quietly {
-                guard native.media.permitsAutomaticPiP,
+                guard !(Thrift.on && Browser.benchAway != true), native.media.permitsAutomaticPiP,
                       tabLeft || !automaticPiPFullscreen(native), AutomaticPiPSites.shared.allows(tab.address),
                       Players.follows(tab), !tabs.contains(where: \.pictureInPicture),
                       !floater.showing || floater.homing else { return }
@@ -6367,7 +6367,7 @@ final class Browser: NSObject, ObservableObject, Relaying {
         guard let tab, !tab.gone, !tab.isBlank, !tab.asleep, let web = tab.webKitOnly("WebKit native page lifecycle", build: false),
               tab.delegate === self, everyTab.contains(where: { $0 === tab }) else { return }
         if quietly {
-            guard tabLeft || !automaticPiPFullscreen(web), AutomaticPiPSites.shared.allows(tab.address),
+            guard !(Thrift.on && Browser.benchAway != true), tabLeft || !automaticPiPFullscreen(web), AutomaticPiPSites.shared.allows(tab.address),
                   Players.follows(tab), !tabs.contains(where: \.pictureInPicture),
                   !floater.showing || floater.homing else { return }
         }
@@ -9414,7 +9414,18 @@ extension Browser {
     func letGo() {
         fullscreenDeparture.stop()
         stopWatching()
-        for tab in tabs + parkedTabs + outside { tab.close() }
+        bag.removeAll()
+        peeking = nil
+        peekFrom = nil
+        floater.drop()
+        for tab in tabs + parkedTabs + outside {
+            dropAsks(tab)
+            tab.close()
+        }
+        tabs = []
+        parked = [:]
+        outside = []
+        activeID = nil
     }
 
     /// A small window's page, closed without being kept.
