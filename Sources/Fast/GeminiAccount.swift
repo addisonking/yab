@@ -121,7 +121,7 @@ final class GeminiAccount: ObservableObject {
     var available: Bool {
         if ready { return true }
         guard enabled, signedIn == nil, AgentSetup.connected("gemini") else { return false }
-        return Shell.cached.map { (binary ?? $0.gemini) != nil } ?? true
+        return binary != nil || (AgentLaunch.here("gemini") ?? true)
     }
 
     private convenience init() { self.init(binary: Shell.cached?.gemini) }
