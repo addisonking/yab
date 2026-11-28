@@ -81,6 +81,18 @@ struct GeminiToolErrorTests {
         #expect(try GeminiRunnerTests.result(&stream)?.succeeded == false)
     }
 
+    @Test func structuredMCPErrorWithDenialContentStillFailsTheTurn() throws {
+        var stream = GeminiStream(yabTools: true)
+        _ = try stream.prompt("Read the page")
+        _ = try GeminiRunnerTests.initialize(&stream)
+        let events = stream.receive(try GeminiRunnerTests.line(["event": "step_update", "step_update": [
+            "conversation_id": "G1", "step_index": 1, "state": "DONE", "step_type": "tool",
+            "tool_name": GeminiRunnerTests.yabTool,
+            "tool_info": ["output": ["isError": true, "content": [["type": "text", "text": "permission denied"]]]]]]))
+        #expect(events.contains { if case .step(let item) = $0 { return item.state == .failed }; return false })
+        #expect(try GeminiRunnerTests.result(&stream)?.succeeded == false)
+    }
+
     @Test func aNativeRecoveryNeverErasesALaterYabToolPermissionDenial() throws {
         var stream = GeminiStream(yabTools: true)
         _ = try stream.prompt("Read through Yab")

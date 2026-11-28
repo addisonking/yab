@@ -481,12 +481,15 @@ struct GeminiStream {
                 let output = tool["output"] as? String ?? ""
                 let structured = tool["output"] as? [String: Any]
                     ?? (try? JSONSerialization.jsonObject(with: Data(output.utf8))) as? [String: Any]
+                let structuredText = (structured?["content"] as? [[String: Any]] ?? [])
+                    .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                let outputText = output.isEmpty ? structuredText : output
                 let stepFailed = state == "ERROR" || error != nil || structured?["isError"] as? Bool == true
                 let errorDetail = [error?["type"] as? String, error?["message"] as? String].compactMap { $0 }.joined(separator: " ")
-                let denied = Self.denial(errorDetail) || (stepFailed && Self.denial(output))
+                let denied = Self.denial(errorDetail) || (stepFailed && Self.denial(outputText))
                 if stepFailed { item.state = .failed }
                 if denied { failure = "Gemini could not complete a tool." }
-                if !output.isEmpty { item.text = String(output.suffix(ChatItem.outputKept)) }
+                if !outputText.isEmpty { item.text = String(outputText.suffix(ChatItem.outputKept)) }
                 if let message = error?["message"] as? String { item.text = message }
             }
             if item.state != .failed { item.state = state == "DONE" ? .done : .running }
